@@ -1,0 +1,47 @@
+{
+  "database": {
+    "path": "cie_database.db",
+    "backup_enabled": true,
+    "backup_interval_hours": 24
+  },
+  "scanning": {
+    "default_recursive": true,
+    "chunk_size": 4096,
+    "max_file_size_mb": 1024,
+    "skip_hidden_files": true,
+    "skip_system_files": true
+  },
+  "quarantine": {
+    "directory": "quarantine",
+    "auto_cleanup_days": 30,
+    "max_quarantine_size_gb": 10,
+    "compression_enabled": false
+  },
+  "detection": {
+    "checksum_algorithm": "sha256",
+    "binary_analysis_enabled": true,
+    "structure_validation_enabled": true,
+    "null_byte_threshold": 0.5,
+    "pattern_detection_enabled": true
+  },
+  "gui": {
+    "theme": "default",
+    "window_width": 1000,
+    "window_height": 700,
+    "auto_refresh": false,
+    "show_hidden_files": false
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "cie.log",
+    "max_size_mb": 10,
+    "backup_count": 5
+  },
+  "file_types": {
+    "image_extensions": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"],
+    "document_extensions": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".rtf"],
+    "archive_extensions": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"],
+    "database_extensions": [".db", ".sqlite", ".sqlite3", ".mdb"],
+    "binary_extensions": [".exe", ".dll", ".so", ".dylib", ".bin"]
+  }
+}

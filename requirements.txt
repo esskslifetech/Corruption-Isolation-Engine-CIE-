@@ -1,0 +1,85 @@
+# Python dependencies for Corruption Isolation Engine (CIE)
+
+# Core dependencies
+tkinter  # Usually comes with Python, but listed for reference
+
+# File handling and analysis
+pathlib2>=2.3.0; python_version < "3.4"
+
+# Database support
+sqlite3  # Usually comes with Python
+
+# Image processing and validation
+Pillow>=9.0.0
+
+# PDF handling and validation
+PyPDF2>=3.0.0
+PyPDF4>=3.0.0
+
+# Archive handling
+zipfile36>=0.1.3; python_version < "3.6"
+
+# Media file processing (requires FFmpeg installation)
+ffmpeg-python>=0.2.0
+
+# Enhanced crypto for better checksums
+cryptography>=3.4.8
+
+# Office document handling
+python-docx>=0.8.11
+openpyxl>=3.0.9
+
+# Additional file type detection
+python-magic>=0.4.24; sys_platform != "win32"
+python-magic-bin>=0.4.14; sys_platform == "win32"
+
+# Progress bars for CLI usage
+tqdm>=4.62.0
+
+# Development dependencies (optional)
+pytest>=6.2.0
+pytest-cov>=2.12.0
+black>=21.0.0
+flake8>=3.9.0
+
+
+# Test requirements for Corruption Isolation Engine
+
+# Core testing framework
+pytest>=6.2.0
+pytest-cov>=2.12.0
+pytest-mock>=3.6.0
+pytest-xdist>=2.4.0  # For parallel testing
+
+# Coverage reporting
+coverage>=5.5.0
+coverage-badge>=1.1.0
+
+# Performance testing
+psutil>=5.8.0
+memory-profiler>=0.60.0
+
+# Mock and fixtures
+responses>=0.20.0  # For HTTP mocking
+factory-boy>=3.2.0  # For test data generation
+faker>=13.0.0  # For fake data generation
+/
+# Reporting
+pytest-html>=3.1.0
+pytest-json-report>=1.4.0
+allure-pytest>=2.9.0  # For Allure reports
+
+# Utilities
+pytest-timeout>=2.1.0  # Test timeout
+pytest-rerunfailures>=10.2  # Rerun failed tests
+pytest-benchmark>=3.4.0  # Benchmarking
+
+# Development dependencies
+black>=21.0.0
+flake8>=3.9.0
+mypy>=0.910
+isort>=5.9.0
+
+# Documentation for tests
+sphinx>=4.0.0
+sphinx-rtd-theme>=1.0.0

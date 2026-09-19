@@ -413,15 +413,42 @@ def save_custom_analysis(conn: sqlite3.Connection, result: CustomAnalysisResult)
 ```
 tests/
 ├── conftest.py                  # shared fixtures (corpus, detector, real-file builders)
-├── test_core_analyzer.py        # detector, statuses, baselines, migration
-├── test_format_validators.py    # per-format validators
+├── make_fixtures.py             # regenerates tests/fixtures/ (not a test module)
+├── fixtures/                    # committed, all-valid files that CI scans
+├── test_core_analyzer.py        # detector, statuses, baselines, migration, rebaseline
+├── test_format_validators.py    # per-format validators (incl. PPTX via python-pptx)
 ├── test_processing_modules.py   # encodings, processors, strategies
 ├── test_cie_math.py             # entropy / variance / checksums
 ├── test_import_hygiene.py       # no stdlib shadowing, modules import standalone
-└── test_cli.py                  # end-to-end CLI: scan, JSON, exit codes, quarantine
+├── test_ci.py                   # the CI contract: workflow + clean fixture scan
+└── test_cli.py                  # end-to-end CLI: scan, JSON, exit codes, quarantine, rebaseline
 ```
 
-Run them with `make test`, or `python3 -m pytest tests/ -q`.
+Run them with `make test`, or `python3 -m pytest tests/ -q` (186 tests).
+
+### Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, on a clean
+checkout, and must stay green:
+
+```bash
+pip install -r requirements.txt
+make cpp
+python3 -m pytest
+python3 cie.py --scan tests/fixtures --fail-on-findings
+```
+
+Two rules keep it meaningful:
+
+1. **Fixtures must stay valid.** `tests/fixtures/` is scanned with
+   `--fail-on-findings`, so the command exits non-zero the moment the scanner
+   flags healthy data. Regenerate the directory with
+   `python3 tests/make_fixtures.py` (it re-validates everything it writes);
+   never hand-edit the files, and never add a damaged file here — damaged
+   fixtures belong in `conftest`-built corpora inside the tests.
+2. **New behaviour needs a test in the same change.** The audit found that the
+   repository's tests had never executed most of the CLI; a feature that is not
+   covered will regress silently.
 
 ### Writing Tests
 

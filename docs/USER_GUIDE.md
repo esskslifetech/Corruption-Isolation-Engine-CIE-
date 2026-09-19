@@ -172,6 +172,30 @@ python3 cie.py --scan /path/to/directory --verbose
 python3 cie.py --scan /path/to/directory --fail-on-findings
 ```
 
+#### Accept a Reviewed File as the New Baseline
+
+After you look at a finding and decide the file is fine (a document that was
+edited on purpose, a file restored from backup, a download you verified), tell
+the engine so it stops reporting it:
+
+```bash
+# Show what would change, without touching the database
+python3 cie.py --rebaseline /path/to/file --dry-run
+
+# Accept the file (or every changed file under a directory)
+python3 cie.py --rebaseline /path/to/file-or-directory
+```
+
+Re-baselining records today's size, checksum and entropy as the trusted values
+and clears the previous finding. It refuses files whose structure the
+validators reject (so it cannot be used to bless a broken file by accident);
+`--rebaseline-force` overrides that, and should only be used when you have
+checked the file yourself. `--json` prints the accepted / refused / missing
+lists in machine-readable form.
+
+Exit codes: `0` everything accepted, `1` nothing accepted (missing paths or
+refused files), `3` partially accepted.
+
 ### Configuration Options
 
 #### Database Settings

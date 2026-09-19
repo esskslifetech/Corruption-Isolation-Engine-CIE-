@@ -70,6 +70,13 @@ except ImportError:  # pragma: no cover
     openpyxl = None  # type: ignore[assignment]
     OPENPYXL_AVAILABLE = False
 
+try:
+    import pptx  # python-pptx
+    PPTX_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    pptx = None  # type: ignore[assignment]
+    PPTX_AVAILABLE = False
+
 FFPROBE_AVAILABLE = shutil.which("ffprobe") is not None
 
 
@@ -996,6 +1003,73 @@ class DocumentValidator:
 
         return ValidationResult.ok(format_info=format_info)
 
+    def validate_pptx(self, file_path: FilePath) -> ValidationResult:
+        """PPTX validation: package layout, part root, then python-pptx.
+
+        Before this existed, `.pptx` only received the generic zip/signature
+        check, so a PowerPoint file whose presentation part was damaged could
+        pass - and the README advertised PPTX as supported.
+        """
+        path = _path(file_path)
+        base_result = self._archive_validator.validate(path)
+        if not base_result.is_valid:
+            return base_result
+
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile) as exc:
+            return ValidationResult.invalid(
+                f"PPTX validation error: {exc}",
+                format_info={"extension": ".pptx", "validator": "pptx-structure", "checked": True},
+            )
+
+        issues: list[str] = []
+        if "[Content_Types].xml" not in names:
+            issues.append("missing [Content_Types].xml")
+        if "ppt/presentation.xml" not in names:
+            issues.append("missing ppt/presentation.xml")
+        else:
+            root_tag = _zip_member_root_tag(path, "ppt/presentation.xml")
+            if root_tag is None:
+                issues.append("ppt/presentation.xml is not readable XML")
+            elif not root_tag.endswith("}presentation"):
+                issues.append(f"ppt/presentation.xml root is {root_tag}, not p:presentation")
+
+        if issues:
+            return ValidationResult.invalid(
+                "invalid PPTX structure",
+                format_info={"extension": ".pptx", "validator": "pptx-structure", "checked": True},
+                corruption_details=issues,
+            )
+
+        format_info = {
+            **base_result.format_info,
+            "extension": ".pptx",
+            "validator": "pptx-structure",
+            "checked": True,
+        }
+
+        if PPTX_AVAILABLE:
+            try:
+                presentation = pptx.Presentation(path)
+                slide_count = len(presentation.slides)
+                format_info = {
+                    **format_info,
+                    "validator": "python-pptx",
+                    "slide_count": slide_count,
+                    "slide_width": presentation.slide_width,
+                    "slide_height": presentation.slide_height,
+                }
+            except Exception as exc:
+                return ValidationResult.invalid(
+                    "python-pptx cannot read this PPTX package",
+                    format_info={"extension": ".pptx", "validator": "python-pptx", "checked": True},
+                    corruption_details=[f"{type(exc).__name__}: {exc}"],
+                )
+
+        return ValidationResult.ok(format_info=format_info)
+
 
 class MediaValidator:
     """Media validation through ffprobe."""
@@ -1123,6 +1197,7 @@ class FormatValidatorFactory:
     _MEDIA_EXTENSIONS = frozenset({".mp4", ".avi", ".mov", ".mkv", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".webm"})
     _DOCX_EXTENSIONS = frozenset({".docx"})
     _XLSX_EXTENSIONS = frozenset({".xlsx"})
+    _PPTX_EXTENSIONS = frozenset({".pptx"})
 
     @classmethod
     def get_validator(cls, file_path: FilePath) -> SupportsValidation | None:
@@ -1146,6 +1221,8 @@ class FormatValidatorFactory:
             return cls
         if extension in cls._XLSX_EXTENSIONS:
             return cls
+        if extension in cls._PPTX_EXTENSIONS:
+            return cls
         if extension in MagicSignatureValidator._SIGNATURES:
             return cls._magic_validator
 
@@ -1167,6 +1244,8 @@ class FormatValidatorFactory:
                 return labelled(cls._document_validator.validate_docx(path))
             if extension in cls._XLSX_EXTENSIONS:
                 return labelled(cls._document_validator.validate_xlsx(path))
+            if extension in cls._PPTX_EXTENSIONS:
+                return labelled(cls._document_validator.validate_pptx(path))
 
             validator = cls.get_validator(path)
             if validator is None:
@@ -1247,6 +1326,7 @@ def get_library_status() -> dict[str, bool]:
         "Built-in Magic Validator": True,
         "Pillow (Images)": PILLOW_AVAILABLE,
         (f"{PDF_LIBRARY_NAME} (PDFs)" if PYPDF2_AVAILABLE else "pypdf (PDFs)"): PYPDF2_AVAILABLE,
+        "python-pptx (PowerPoint)": PPTX_AVAILABLE,
         "ffprobe (Media)": FFPROBE_AVAILABLE,
         "python-docx (Word)": DOCX_AVAILABLE,
         "openpyxl (Excel)": OPENPYXL_AVAILABLE,

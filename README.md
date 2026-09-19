@@ -7,8 +7,9 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 > **Status note (audit revision).** The v2.0 tree shipped with a stdlib-shadowing
 > module name that broke every `cie.py` command, unit tests that called functions
 > which did not exist, and a requirements file that `pip` refused to install.
-> Those defects are fixed in this revision; `python3 -m pytest tests/` (158
-> tests) and the CLI matrix in `docs/USER_GUIDE.md` pass. Measured detection
+> Those defects are fixed in this revision; `python3 -m pytest tests/` (186
+> tests) and the CLI matrix in `docs/USER_GUIDE.md` pass, and the workflow in
+> `.github/workflows/ci.yml` re-checks all of it on a clean checkout. Measured detection
 > limits and the remaining known gaps are listed under
 > [Verification status](#verification-status) - please read that section before
 > relying on a "healthy" verdict.
@@ -23,7 +24,8 @@ A powerful software tool for detecting, isolating, and separating corrupted file
   - **PDFs**: pypdf (pypdf-compatible API) for PDF structure and content validation
   - **Archives**: ZIP file integrity testing
   - **Media**: FFmpeg for video/audio file validation
-  - **Documents**: python-docx for Word, openpyxl for Excel files
+  - **Documents**: python-docx for Word, openpyxl for Excel, python-pptx for
+    PowerPoint packages
 - **Binary File Analysis**: Deep analysis of file structures and binary patterns
 - **Ransomware Detection**: Entropy-based heuristics for encrypted file detection
 - **Automatic Quarantine**: Option to automatically move corrupted files to quarantine
@@ -32,7 +34,12 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **SQLite Database**: Persistent storage of file metadata and analysis history with WAL mode
 - **Cross-Platform Support**: Works on Linux, macOS, and Windows
 - **Concurrent Processing**: Multi-threaded scanning with configurable worker threads
-- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 158 pytest tests
+- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 186 pytest tests
+- **Continuous Integration**: the workflow in `.github/workflows/ci.yml` installs
+  the dependencies, builds the C++ engine, runs the tests and scans a directory
+  of known-good fixtures with `--fail-on-findings` on every push
+- **Deliberate re-baselining**: `python3 cie.py --rebaseline <path>` accepts the
+  current content of a file you have reviewed as the new baseline
 - **Quarantine with restore**: quarantined files are logged and can be restored, never
   silently deleted, and the engine's own database is never scanned or quarantined
 
@@ -168,6 +175,12 @@ python3 cie.py --scan /path/to/directory --fail-on-findings
 python3 cie.py --list-quarantine
 python3 cie.py --restore quarantine/<name>
 
+# Accept the current content of a file you have reviewed as its new baseline
+# (clears the finding and stops reporting it). Refuses files that fail format
+# validation unless --rebaseline-force is given; --dry-run reports only.
+python3 cie.py --rebaseline /path/to/file-or-directory
+python3 cie.py --rebaseline /path/to/file --dry-run
+
 # Use a configuration file (CLI flags always win)
 python3 cie.py --scan /path/to/directory --config config/cie_config.json
 ```
@@ -179,7 +192,10 @@ python3 cie.py --scan /path/to/directory --config config/cie_config.json
 | 0    | Scan completed, nothing corrupted |
 | 1    | Usage error (bad arguments, missing directory, unreadable config) |
 | 2    | Scan completed and corruption / ransomware-like findings were found (`--fail-on-findings`) |
-| 3    | Scan incomplete: at least one file could not be analysed |
+| 3    | Scan incomplete: at least one file could not be analysed; also `--rebaseline` when some paths were accepted and others refused |
+
+`--rebaseline` uses the same table: 0 = everything accepted, 1 = nothing
+accepted (missing paths or refused files), 3 = partially accepted.
 
 ## File Corruption Detection Methods
 
@@ -187,7 +203,8 @@ The CIE uses multiple methods to detect file corruption:
 
 1. **Format-Specific Validation**: magic bytes plus real decoders - Pillow
    (images), pypdf (PDF), zip CRCs, tar header checksums, 7z/gzip CRCs,
-   python-docx / openpyxl (OOXML parts), ffprobe (media when installed)
+   python-docx / openpyxl / python-pptx (OOXML parts), ffprobe (media when
+   installed)
 2. **Binary Pattern Analysis**: null-byte and control-character ratios,
    binary junk in text files
 3. **Size Anomaly Detection**: zero-byte files (reported as a warning, never
@@ -220,7 +237,9 @@ Measured on the audit corpus (18 damaged files + 12 healthy files):
 ## Supported File Types
 
 - **Images**: JPEG, PNG, GIF, BMP, TIFF, WebP (Pillow; CRC-checked for PNG/WebP)
-- **Documents**: PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, XML, Markdown
+- **Documents**: PDF, DOCX, XLSX, PPTX (python-pptx: the package must open as a
+  presentation, not merely be a zip with the right part names), TXT, CSV, JSON,
+  XML, Markdown
 - **Archives**: ZIP, JAR/APK (CRCs), TAR (checksums), 7Z (start-header CRC), GZ
 - **Media**: MP4/MKV/MP3 and friends (needs `ffprobe` for content checks;
   container signatures are checked without it)
@@ -305,7 +324,7 @@ make clean-quarantine
 # Full clean (including databases)
 make clean-all
 
-# Run tests (pytest, 158 tests)
+# Run tests (pytest, 186 tests)
 make test
 
 # Run the self-tests embedded in each module (no pytest needed)
@@ -323,6 +342,36 @@ make dist
 
 # Show all available commands
 make help
+```
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` verifies a **clean checkout** on every push and pull
+request. The verification steps are exactly these four commands, in this order:
+
+```bash
+pip install -r requirements.txt
+make cpp
+python3 -m pytest
+python3 cie.py --scan tests/fixtures --fail-on-findings
+```
+
+`tests/fixtures/` holds nine *valid* files (text, CSV, PNG, JPEG, PDF, DOCX,
+XLSX, PPTX, ZIP) built by `python3 tests/make_fixtures.py` (run it to
+regenerate them; it also re-validates every fixture it writes), so the last
+command must exit `0`. A non-zero exit means the scanner started flagging healthy data — the
+exact class of regression the audit's findings lived in — and turns the build
+red. The fixture directory is intentionally small (~70 KB) so it stays
+reviewable in a diff, and it is regenerated, never hand-edited.
+
+Reproduce the whole thing locally:
+
+```bash
+git clone <repo> && cd CIE-audit
+pip install -r requirements.txt
+make cpp
+python3 -m pytest
+python3 cie.py --scan tests/fixtures --fail-on-findings
 ```
 
 ## Configuration
@@ -400,11 +449,12 @@ corpus; the C++ helper reached 107.3 MB/s but is not wired into the engine):
 
 All numbers below were measured by the audit harness (`/home/user/audit/`) on
 Linux with Python 3.13.14, Pillow 12.3, pypdf 6.19, python-docx 1.1.2,
-openpyxl 3.1.5, numpy 2.3.5 and pytest 9.0.3 installed, **ffmpeg absent**:
+openpyxl 3.1.5, python-pptx 1.0.2, numpy 2.3.5 and pytest 9.0.3 installed,
+**ffmpeg absent**:
 
 | Check | Result |
 |-------|--------|
-| pytest suite | 158 passed |
+| pytest suite | 186 passed |
 | CLI commands (`--version`, `--library-status`, `--self-test`, `--scan`, `--modular-scan`, `--fast-scan`, `--list-quarantine`, `--restore`) | all exit 0 |
 | Recall, formats with integrity metadata | 9/9 |
 | Recall, same-size damage found on a *second* scan (baseline) | 12/12 |
@@ -412,6 +462,7 @@ openpyxl 3.1.5, numpy 2.3.5 and pytest 9.0.3 installed, **ffmpeg absent**:
 | False positives on 12 real-world healthy files (GPG, KDBX, disk image, OPUS, MKV, JAR, padded JPEG, MP4 with leading `free` box, ...) | 0 |
 | Self-quarantine (engine's own DB / WAL / quarantine dir) | refused |
 | Restore round-trip | pass |
+| CI workflow, clean checkout (`pip install` → `make cpp` → `pytest` → fixture scan) | pass (fixtures exit 0 with `--fail-on-findings`) |
 
 Known limitations, stated rather than hidden:
 

@@ -78,6 +78,7 @@ class ScanSummary:
     corruption_rate_percent: float
     file_type_counts: tuple[tuple[str, int], ...]
     corrupted_type_counts: tuple[tuple[str, int], ...]
+    suspected_ransomware_files: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +150,15 @@ def result_status_label(result: FileAnalysisResultLike) -> str:
     return "CORRUPTED" if result_is_corrupted(result) else "OK"
 
 
+def result_status_name(result: FileAnalysisResultLike) -> str:
+    """Best-effort status name for a result ("CORRUPTED_FORMAT", "VALID", ...)."""
+    status = getattr(result, "status", None)
+    if status is None:
+        return ""
+    name = getattr(status, "name", None)
+    return str(name if name is not None else status)
+
+
 def humanize_bytes(size_bytes: int) -> str:
     size = float(max(size_bytes, 0))
     units = ("B", "KB", "MB", "GB", "TB", "PB")
@@ -171,6 +181,10 @@ def build_scan_summary(results: Sequence[FileAnalysisResultLike]) -> ScanSummary
     largest_file_bytes = max((result_size(result) for result in results), default=0)
     corruption_rate_percent = (corrupted_files / total_files * 100.0) if total_files else 0.0
 
+    suspected_ransomware_files = sum(
+        1 for result in results if result_status_name(result) == "SUSPECTED_RANSOMWARE"
+    )
+
     file_type_counts = Counter(result_type(result) for result in results)
     corrupted_type_counts = Counter(result_type(result) for result in results if result_is_corrupted(result))
 
@@ -183,6 +197,7 @@ def build_scan_summary(results: Sequence[FileAnalysisResultLike]) -> ScanSummary
         corruption_rate_percent=corruption_rate_percent,
         file_type_counts=tuple(sorted(file_type_counts.items(), key=lambda item: (-item[1], item[0]))),
         corrupted_type_counts=tuple(sorted(corrupted_type_counts.items(), key=lambda item: (-item[1], item[0]))),
+        suspected_ransomware_files=suspected_ransomware_files,
     )
 
 
@@ -196,8 +211,16 @@ def format_summary_text(summary: ScanSummary) -> str:
         f"Total bytes         : {summary.total_bytes:,} ({humanize_bytes(summary.total_bytes)})",
         f"Largest file        : {summary.largest_file_bytes:,} ({humanize_bytes(summary.largest_file_bytes)})",
         f"Corruption rate     : {summary.corruption_rate_percent:.2f}%",
-        "",
     ]
+
+    if summary.suspected_ransomware_files:
+        verb = "looks" if summary.suspected_ransomware_files == 1 else "look"
+        lines.append(
+            f"  (of the corrupted files, {summary.suspected_ransomware_files} "
+            f"{verb} like ransomware rather than format damage)"
+        )
+
+    lines.append("")
 
     if summary.file_type_counts:
         lines.append("Top File Types")

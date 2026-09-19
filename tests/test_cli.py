@@ -277,3 +277,95 @@ def test_engine_never_quarantines_its_own_database(tmp_path):
     assert db.exists(), "the CLI moved its own database"
     reported = {Path(entry["file_path"]).name for entry in json.loads((tmp_path / "r.json").read_text())["results"]}
     assert not [name for name in reported if name.startswith("cie.db")], reported
+
+
+# ---------------------------------------------------------------------------
+# --rebaseline: accept a reviewed file on purpose
+# ---------------------------------------------------------------------------
+
+def _scan_corrupted(stdout: str) -> int:
+    for line in stdout.splitlines():
+        if line.startswith("Corrupted files"):
+            return int(line.split(":")[1].strip())
+    raise AssertionError(f"no summary in output:\n{stdout}")
+
+
+def test_rebaseline_cli_accepts_a_reviewed_file(tmp_path):
+    root = tmp_path / "work"
+    root.mkdir()
+    document = root / "notes.txt"
+    document.write_text("original\n" * 40)
+    db = tmp_path / "rb.db"
+
+    assert run("--scan", str(root), "--db-path", str(db)).returncode == 0
+    document.write_text("edited deliberately\n" * 40)
+    assert _scan_corrupted(run("--scan", str(root), "--db-path", str(db)).stdout) == 1
+
+    result = run("--rebaseline", str(document), "--db-path", str(db))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Accepted as new baseline" in result.stdout
+    assert _scan_corrupted(run("--scan", str(root), "--db-path", str(db)).stdout) == 0
+
+
+def test_rebaseline_cli_refuses_a_broken_file(tmp_path):
+    root = tmp_path / "work"
+    root.mkdir()
+    broken = root / "broken.png"
+    broken.write_bytes(b"not a png")
+    db = tmp_path / "rb.db"
+
+    result = run("--rebaseline", str(broken), "--db-path", str(db))
+    assert result.returncode == 1, result.stdout
+    assert "Refused" in result.stdout
+    assert "--rebaseline-force" in result.stdout
+
+
+def test_rebaseline_cli_force_accepts_a_broken_file(tmp_path):
+    root = tmp_path / "work"
+    root.mkdir()
+    broken = root / "broken.png"
+    broken.write_bytes(b"not a png")
+    db = tmp_path / "rb.db"
+
+    result = run("--rebaseline", str(broken), "--rebaseline-force", "--db-path", str(db))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rebaseline_cli_dry_run_leaves_the_finding(tmp_path):
+    root = tmp_path / "work"
+    root.mkdir()
+    document = root / "notes.txt"
+    document.write_text("original\n" * 40)
+    db = tmp_path / "rb.db"
+    run("--scan", str(root), "--db-path", str(db))
+    document.write_text("edited\n" * 40)
+    run("--scan", str(root), "--db-path", str(db))
+
+    result = run("--rebaseline", str(document), "--dry-run", "--db-path", str(db))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Dry run" in result.stdout
+    assert _scan_corrupted(run("--scan", str(root), "--db-path", str(db)).stdout) == 1
+
+
+def test_rebaseline_cli_json(tmp_path):
+    root = tmp_path / "work"
+    root.mkdir()
+    document = root / "notes.txt"
+    document.write_text("original\n" * 40)
+    db = tmp_path / "rb.db"
+    run("--scan", str(root), "--db-path", str(db))
+    document.write_text("edited\n" * 40)
+    run("--scan", str(root), "--db-path", str(db))
+
+    result = run("--rebaseline", str(document), "--json", "--db-path", str(db))
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is False
+    assert [Path(entry).name for entry in payload["rebaselined"]] == ["notes.txt"]
+    assert payload["refused"] == []
+
+
+def test_rebaseline_requires_a_path(tmp_path):
+    result = run("--rebaseline")
+    assert result.returncode != 0
+    assert "expected one argument" in (result.stderr or "")

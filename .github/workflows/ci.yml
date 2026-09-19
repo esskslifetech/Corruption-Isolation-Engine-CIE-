@@ -1,0 +1,78 @@
+name: CI
+
+# Clean-checkout verification. Every command below is run against a fresh
+# clone with no database, no quarantine directory and no caches, which is the
+# configuration that the audit found broken (all runtime commands exited 1,
+# garbage files were reported healthy, the tool quarantined its own database).
+#
+# Reproduce locally:
+#   git clone <repo> && cd CIE-audit
+#   pip install -r requirements.txt
+#   make cpp
+#   python3 -m pytest
+#   python3 cie.py --scan tests/fixtures --fail-on-findings
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Clean-checkout verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add more versions here once they are verified locally; the suite is
+        # only "green" for versions that actually appear in this list.
+        python-version: ["3.13"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show toolchain versions
+        run: |
+          python3 --version
+          g++ --version | head -n 1
+          python3 -c "import sqlite3, zlib; print('stdlib ok')"
+
+      - name: pip install -r requirements.txt
+        run: pip install -r requirements.txt
+
+      - name: make cpp
+        run: make cpp
+
+      - name: python3 -m pytest
+        run: python3 -m pytest
+
+      - name: python3 cie.py --scan tests/fixtures --fail-on-findings
+        # tests/fixtures/ holds only valid files, so a non-zero exit here means
+        # the scanner started flagging healthy data - a regression this
+        # repository has shipped before. Regenerate the fixtures with:
+        #   python3 tests/make_fixtures.py
+        run: python3 cie.py --scan tests/fixtures --fail-on-findings
+
+      - name: Upload the scan report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-report
+          path: |
+            cie_database.db
+            cie_database.db-wal
+          if-no-files-found: ignore
+          retention-days: 7

@@ -273,16 +273,32 @@ def test_encrypted_looking_file_with_ransomware_extension_is_flagged(detector, m
     assert detector.analyze_file(path).status is FileStatus.SUSPECTED_RANSOMWARE
 
 
-def test_high_entropy_office_file_is_not_ransomware(detector, make_file):
+@pytest.mark.parametrize("suffix", ["docx", "pptx"])
+def test_high_entropy_office_file_is_not_ransomware(detector, workdir, suffix):
+    """A high-entropy *office document* must not be called ransomware.
+
+    Office packages are compressed archives and legitimately contain
+    high-entropy data, so entropy alone must never trigger the ransomware
+    verdict. The fixtures are genuine documents (built with python-docx /
+    python-pptx) with an incompressible blob added inside the package, which
+    is exactly the shape of a false positive this rule exists to prevent.
+    """
     import os
     import zipfile
 
-    path = make_file("deck.pptx", b"")
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", "<Types/>")
-        archive.writestr("ppt/presentation.xml", os.urandom(40000).hex())
+    from conftest import make_real_docx, make_real_pptx
+
+    if suffix == "docx":
+        path = make_real_docx(workdir / "deck.docx")
+    else:
+        path = make_real_pptx(workdir / "deck.pptx")
+
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("docProps/high-entropy.bin", os.urandom(60000))
+
     result = detector.analyze_file(path)
     assert result.is_corrupted is False, result.error_message
+    assert result.status is not FileStatus.SUSPECTED_RANSOMWARE
 
 
 def test_entropy_jump_versus_baseline_is_flagged(detector, make_file):
@@ -350,3 +366,119 @@ def test_real_png_bit_rot_is_detected(detector, make_file):
     data = make_real_png()
     path = make_file("rot.png", corrupt_byte(data, len(data) // 2))
     assert detector.analyze_file(path).is_corrupted is True
+
+
+# ---------------------------------------------------------------------------
+# re-baselining: deliberately accepting a reviewed change
+# ---------------------------------------------------------------------------
+
+def test_rebaseline_accepts_a_reviewed_change(detector, workdir):
+    """After a human reviews a finding, the new content becomes the baseline."""
+    path = workdir / "notes.txt"
+    path.write_text("original content\n" * 40)
+    assert detector.analyze_file(path).status is FileStatus.NEW_FILE
+
+    path.write_text("edited content, deliberately different\n" * 40)
+    flagged = detector.analyze_file(path)
+    assert flagged.status is FileStatus.CORRUPTED_SIZE
+    assert flagged.is_corrupted is True
+
+    outcomes = detector.rebaseline([path])
+    assert [o.action for o in outcomes] == ["rebaselined"]
+    assert outcomes[0].previous_status == "CORRUPTED_SIZE"
+
+    after = detector.analyze_file(path)
+    assert after.status is FileStatus.VALID
+    assert after.is_corrupted is False
+
+
+def test_rebaseline_clears_the_previous_finding_in_the_database(detector, workdir, config):
+    path = workdir / "notes.txt"
+    path.write_text("one\n" * 50)
+    detector.analyze_file(path)
+    path.write_text("two\n" * 50)
+    detector.analyze_file(path)
+    detector.rebaseline([path])
+
+    with sqlite3.connect(config.db_path) as connection:
+        row = connection.execute(
+            "SELECT is_corrupted, first_corrupt FROM file_metadata WHERE file_path = ?",
+            (str(path),),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 0, "rebaseline left is_corrupted set"
+    assert row[1] is None, "rebaseline left first_corrupt set"
+
+
+def test_rebaseline_refuses_a_structurally_broken_file(detector, workdir):
+    """It must not become a way to bless a file that fails validation."""
+    path = workdir / "broken.png"
+    path.write_bytes(b"this is not a png")
+    outcomes = detector.rebaseline([path])
+    assert outcomes[0].action == "refused"
+    assert outcomes[0].reason
+    assert outcomes[0].ok is False
+
+
+def test_rebaseline_force_accepts_a_broken_file(detector, workdir):
+    path = workdir / "broken.png"
+    path.write_bytes(b"this is not a png")
+    outcomes = detector.rebaseline([path], force=True)
+    assert outcomes[0].action == "rebaselined"
+
+
+def test_rebaseline_refuses_the_engines_own_database(detector, config):
+    outcomes = detector.rebaseline([config.db_path])
+    assert outcomes[0].action == "refused"
+    assert "engine" in (outcomes[0].reason or "").lower()
+
+
+def test_rebaseline_reports_missing_paths(detector, workdir):
+    outcomes = detector.rebaseline([workdir / "gone.txt"])
+    assert outcomes[0].action == "missing"
+    assert outcomes[0].ok is False
+
+
+def test_rebaseline_dry_run_does_not_change_anything(detector, workdir, config):
+    path = workdir / "notes.txt"
+    path.write_text("before\n" * 40)
+    detector.analyze_file(path)
+    path.write_text("after\n" * 60)
+    detector.analyze_file(path)
+
+    outcomes = detector.rebaseline([path], dry_run=True)
+    assert outcomes[0].action == "rebaselined"      # it *would* be accepted
+    assert detector.analyze_file(path).status is FileStatus.CORRUPTED_SIZE
+
+
+def test_rebaseline_walks_a_directory(detector, workdir):
+    root = workdir / "changed"
+    root.mkdir()
+    for name in ("a.txt", "b.txt"):
+        path = root / name
+        path.write_text("content\n" * 30)
+        detector.analyze_file(path)
+        path.write_text("changed content\n" * 30)
+        detector.analyze_file(path)
+
+    outcomes = detector.rebaseline([root])
+    assert {o.action for o in outcomes} == {"rebaselined"}
+    assert len(outcomes) == 2
+    assert all(not r.is_corrupted for r in detector.scan_directory(root))
+
+
+def test_rebaseline_keeps_first_seen_history(detector, workdir, config):
+    path = workdir / "notes.txt"
+    path.write_text("content\n" * 30)
+    detector.analyze_file(path)
+    with sqlite3.connect(config.db_path) as connection:
+        first_seen = connection.execute(
+            "SELECT first_seen FROM file_metadata WHERE file_path = ?", (str(path),)
+        ).fetchone()[0]
+
+    detector.rebaseline([path])
+    with sqlite3.connect(config.db_path) as connection:
+        after = connection.execute(
+            "SELECT first_seen FROM file_metadata WHERE file_path = ?", (str(path),)
+        ).fetchone()[0]
+    assert after == first_seen, "rebaseline should not reset first_seen"

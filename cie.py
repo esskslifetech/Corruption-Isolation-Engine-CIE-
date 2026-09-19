@@ -655,6 +655,13 @@ def build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument("--library-status", action="store_true", help="show validator library availability")
     mode_group.add_argument("--list-quarantine", action="store_true", help="list quarantined files")
     mode_group.add_argument("--restore", metavar="FILE", action="append", help="restore a quarantined file (repeatable)")
+    mode_group.add_argument(
+        "--rebaseline",
+        metavar="PATH",
+        action="append",
+        help="accept the current content of PATH (file or directory) as the new "
+             "baseline, clearing existing corruption findings; repeatable",
+    )
     mode_group.add_argument("--self-test", action="store_true", help="run built-in launcher tests")
 
     parser.add_argument(
@@ -693,6 +700,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-deep-validation",
         action="store_true",
         help="use header/signature checks only (skip Pillow/PyPDF2/openpyxl/ffprobe)",
+    )
+    parser.add_argument(
+        "--rebaseline-force",
+        action="store_true",
+        help="with --rebaseline: also accept files that fail format validation "
+             "(use only after checking them yourself)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --rebaseline: report what would change without writing to the database",
     )
     parser.add_argument("--config", metavar="FILE", help="path to cie_config.json (default: config/cie_config.json)")
     parser.add_argument("--no-config", action="store_true", help="ignore the configuration file")
@@ -888,6 +906,89 @@ def run_restore(runtime: RuntimeBundle, args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def run_rebaseline(runtime: RuntimeBundle, args: argparse.Namespace) -> int:
+    """Accept the current content of the given paths as their new baseline.
+
+    Files whose *structure* the validators reject are refused unless
+    --rebaseline-force is given, so this command cannot be used to quietly
+    bless a broken file. Exit codes: 0 all accepted, 1 nothing accepted
+    (bad paths / refused), 3 partial (some accepted, some refused).
+    """
+    detector = build_detector(runtime, args)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    if dry_run:
+        print("Dry run: no changes will be written to the database.", file=sys.stdout)
+
+    outcomes = detector.rebaseline(
+        tuple(args.rebaseline),
+        recursive=not args.no_recursive,
+        force=bool(args.rebaseline_force),
+        dry_run=dry_run,
+    )
+
+    accepted = [o for o in outcomes if o.action == "rebaselined"]
+    refused = [o for o in outcomes if o.action == "refused"]
+    missing = [o for o in outcomes if o.action == "missing"]
+
+    if args.json:
+        payload = {
+            "application": APP_NAME,
+            "version": APP_VERSION,
+            "dry_run": dry_run,
+            "rebaselined": [o.path for o in accepted],
+            "refused": [{"path": o.path, "reason": o.reason} for o in refused],
+            "missing": [{"path": o.path, "reason": o.reason} for o in missing],
+        }
+        text = json.dumps(payload, indent=2)
+    else:
+        lines = [f"{APP_NAME} Re-baseline", "=" * (len(APP_NAME) + 12)]
+        if accepted:
+            lines.append("")
+            lines.append(f"Accepted as new baseline ({len(accepted)}):")
+            for outcome in accepted:
+                previous = f" (was {outcome.previous_status})" if outcome.previous_status else ""
+                lines.append(f"  {outcome.path}{previous}")
+        if refused:
+            lines.append("")
+            lines.append(f"Refused - still failing validation ({len(refused)}):")
+            for outcome in refused:
+                lines.append(f"  {outcome.path}")
+                if outcome.reason:
+                    lines.append(f"      {outcome.reason}")
+            lines.append("")
+            lines.append("  Review these files; pass --rebaseline-force only if you are sure.")
+        if missing:
+            lines.append("")
+            lines.append(f"Not found ({len(missing)}):")
+            for outcome in missing:
+                lines.append(f"  {outcome.path}")
+                if outcome.reason:
+                    lines.append(f"      {outcome.reason}")
+        if not outcomes:
+            lines.append("")
+            lines.append("Nothing to do: no files matched the given paths.")
+        text = "\n".join(lines)
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError as exc:
+            print(f"Error: could not write {args.output}: {exc}", file=sys.stderr)
+            return 1
+        if not args.json:
+            print(text)
+    else:
+        print(text)
+
+    if refused and accepted:
+        return 3
+    if refused or missing or not outcomes:
+        return 1
+    return 0
+
+
 def print_quarantine_listing(detector: Any) -> int:
     try:
         entries = detector.list_quarantine(include_restored=False)
@@ -935,6 +1036,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.library_status,
         args.list_quarantine,
         args.restore,
+        args.rebaseline,
     ])))
 
     try:
@@ -949,6 +1051,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.restore:
         return run_restore(runtime, args)
+
+    if args.rebaseline:
+        return run_rebaseline(runtime, args)
 
     if args.library_status:
         return print_library_status(build_detector(runtime, args))

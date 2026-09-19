@@ -67,6 +67,32 @@ if detector.quarantine_file("/path/to/corrupted/file.txt"):
     print("File successfully quarantined")
 ```
 
+##### `rebaseline(targets, recursive: bool = True, force: bool = False, dry_run: bool = False) -> tuple[RebaselineOutcome, ...]`
+
+Accepts the current content of one or more files as their new baseline, after
+a human has reviewed a finding. Records today's size, checksum and entropy,
+clears `is_corrupted` / `first_corrupt`, and keeps `first_seen`.
+
+**Parameters:**
+- `targets` (Sequence[str]): files or directories to re-baseline
+- `recursive` (bool): walk subdirectories when a target is a directory (default: True)
+- `force` (bool): also accept files that fail format validation (default: False)
+- `dry_run` (bool): report what would happen without writing to the database
+
+**Returns:**
+- `tuple[RebaselineOutcome, ...]`: one entry per file, each with `path`,
+  `action` (`rebaselined` | `refused` | `missing`), `previous_status` and
+  `reason`, plus an `ok` convenience property
+
+**Example:**
+```python
+for outcome in detector.rebaseline(["/path/to/reviewed.docx"], dry_run=True):
+    print(outcome.action, outcome.path, outcome.reason or "")
+```
+
+Files that the validators reject are refused unless `force=True`; the engine's
+own database and quarantine directory are always refused.
+
 ##### `get_library_status() -> Dict[str, bool]`
 
 Returns the availability status of validation libraries.

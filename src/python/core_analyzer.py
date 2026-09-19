@@ -294,6 +294,20 @@ def _parse_timestamp(value: Any) -> datetime | None:
 
 
 @dataclass(frozen=True, slots=True)
+class RebaselineOutcome:
+    """Result of re-baselining one file (accepting its current content)."""
+
+    path: str
+    action: str                     # rebaselined | refused | missing
+    previous_status: str | None = None
+    reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.action == "rebaselined"
+
+
+@dataclass(frozen=True, slots=True)
 class FileAnalysisResult:
     file_path: str
     status: FileStatus
@@ -350,6 +364,54 @@ class IMetadataRepository(Protocol):
     def initialize(self) -> None: ...
     def get_record(self, path: str) -> FileRecord | None: ...
     def upsert_record(self, record: FileRecord, *, update_baseline: bool = True) -> None: ...
+    def rebaseline_record(self, record: FileRecord) -> None: ...
+    def rebaseline_record(self, record: FileRecord) -> None:
+        """Replace the stored baseline with the file's current state.
+
+        Unlike ``upsert_record``, this *clears* ``first_corrupt`` and
+        ``is_corrupted``: the caller has decided that what is on disk now is
+        what should be compared against from now on.
+        """
+        def operation() -> None:
+            with self._connection() as connection:
+                now = datetime.now(timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO file_metadata (
+                        file_path, size_bytes, checksum, last_modified,
+                        is_corrupted, shannon_entropy, file_type, analysis_date,
+                        first_seen, first_corrupt, last_status, last_seen
+                    )
+                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, NULL, ?, ?)
+                    ON CONFLICT(file_path) DO UPDATE SET
+                        size_bytes      = excluded.size_bytes,
+                        checksum        = excluded.checksum,
+                        shannon_entropy = excluded.shannon_entropy,
+                        last_modified   = excluded.last_modified,
+                        is_corrupted    = 0,
+                        file_type       = excluded.file_type,
+                        analysis_date   = excluded.analysis_date,
+                        first_seen      = COALESCE(file_metadata.first_seen, excluded.first_seen),
+                        first_corrupt   = NULL,
+                        last_status     = excluded.last_status,
+                        last_seen       = excluded.last_seen
+                    """,
+                    (
+                        record.path_str,
+                        record.size_bytes,
+                        record.checksum,
+                        record.last_modified_ts,
+                        record.shannon_entropy,
+                        record.file_type,
+                        now,
+                        record.first_seen_ts or time.time(),
+                        record.last_status,
+                        record.last_seen_ts or time.time(),
+                    ),
+                )
+
+        self._run_with_retry(operation)
+
     def log_quarantine(self, original_path: str, quarantine_path: str, reason: str) -> None: ...
     def list_quarantine(self, *, include_restored: bool = False) -> tuple[QuarantineEntry, ...]: ...
     def find_quarantine_entry(self, quarantine_path: str) -> QuarantineEntry | None: ...
@@ -619,6 +681,53 @@ class SQLiteMetadataRepo(IMetadataRepository):
                         int(update_baseline),
                         int(update_baseline),
                         int(update_baseline),
+                    ),
+                )
+
+        self._run_with_retry(operation)
+
+    def rebaseline_record(self, record: FileRecord) -> None:
+        """Replace the stored baseline with the file's current state.
+
+        Unlike ``upsert_record``, this *clears* ``first_corrupt`` and
+        ``is_corrupted``: the caller has decided that what is on disk now is
+        what should be compared against from now on.
+        """
+        def operation() -> None:
+            with self._connection() as connection:
+                now = datetime.now(timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO file_metadata (
+                        file_path, size_bytes, checksum, last_modified,
+                        is_corrupted, shannon_entropy, file_type, analysis_date,
+                        first_seen, first_corrupt, last_status, last_seen
+                    )
+                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, NULL, ?, ?)
+                    ON CONFLICT(file_path) DO UPDATE SET
+                        size_bytes      = excluded.size_bytes,
+                        checksum        = excluded.checksum,
+                        shannon_entropy = excluded.shannon_entropy,
+                        last_modified   = excluded.last_modified,
+                        is_corrupted    = 0,
+                        file_type       = excluded.file_type,
+                        analysis_date   = excluded.analysis_date,
+                        first_seen      = COALESCE(file_metadata.first_seen, excluded.first_seen),
+                        first_corrupt   = NULL,
+                        last_status     = excluded.last_status,
+                        last_seen       = excluded.last_seen
+                    """,
+                    (
+                        record.path_str,
+                        record.size_bytes,
+                        record.checksum,
+                        record.last_modified_ts,
+                        record.shannon_entropy,
+                        record.file_type,
+                        now,
+                        record.first_seen_ts or time.time(),
+                        record.last_status,
+                        record.last_seen_ts or time.time(),
                     ),
                 )
 
@@ -1127,17 +1236,21 @@ class CorruptionEngine:
         if ransomware_status is FileStatus.SUSPECTED_RANSOMWARE:
             return ransomware_status, tuple(reasons)
 
+        # Comparison against the *stored baseline*. The baseline is never
+        # overwritten while a file is damaged, so a finding is not lost on the
+        # next scan the way it was in v2.0.
+        #
+        # Order matters: a file that *was* non-empty and is now zero bytes has
+        # been truncated - that is damage, not a "suspicious empty file". The
+        # empty-file advisory is only for files that are empty when first seen.
+        if record is not None and record.size_bytes != metrics.size_bytes:
+            return FileStatus.CORRUPTED_SIZE, ()
+
         if metrics.size_bytes == 0:
             return FileStatus.SUSPICIOUS_EMPTY, ("empty file",)
 
         if record is None:
             return FileStatus.NEW_FILE, ()
-
-        # Comparison against the *stored baseline*. The baseline is never
-        # overwritten while a file is damaged, so a finding is not lost on the
-        # next scan the way it was in v2.0.
-        if record.size_bytes != metrics.size_bytes:
-            return FileStatus.CORRUPTED_SIZE, ()
 
         if record.checksum != metrics.checksum:
             return FileStatus.CORRUPTED_CHECKSUM, ()
@@ -1458,6 +1571,105 @@ class CorruptionEngine:
         self._logger.info("restored %s -> %s", source.name, target)
         return target
 
+    # -- re-baselining ------------------------------------------------------
+
+    def rebaseline(
+        self,
+        targets: Sequence[FilePath],
+        *,
+        recursive: bool = True,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> tuple[RebaselineOutcome, ...]:
+        """Accept the current content of ``targets`` as the new baseline.
+
+        Used after a human has reviewed a finding and decided the file is fine
+        (for example a document that changed on purpose, or a file restored
+        from backup outside the engine). The stored size/checksum/entropy are
+        overwritten with today's values, ``is_corrupted`` is cleared and
+        ``first_corrupt`` is forgotten.
+
+        Safety: a file whose *structure* the validators reject is refused
+        unless ``force`` is set. Re-baselining must not be a way to silently
+        bless a broken file.
+        """
+        outcomes: list[RebaselineOutcome] = []
+        seen: set[Path] = set()
+
+        for target in targets:
+            path = Path(target).expanduser()
+            if not path.exists():
+                outcomes.append(RebaselineOutcome(str(path), "missing", reason="path does not exist"))
+                continue
+
+            candidates: list[Path]
+            if path.is_dir():
+                candidates = list(self._collect_files(path, recursive))
+            else:
+                candidates = [path]
+
+            for candidate in candidates:
+                resolved = candidate.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+
+                if self._is_internal_path(resolved):
+                    outcomes.append(
+                        RebaselineOutcome(
+                            str(resolved), "refused",
+                            reason="this is the engine's own state (database/quarantine)",
+                        )
+                    )
+                    continue
+
+                try:
+                    metrics = self._calculator.calculate(resolved)
+                except FileAccessError as exc:
+                    outcomes.append(RebaselineOutcome(str(resolved), "missing", reason=str(exc)))
+                    continue
+
+                validation = self._format_validator.validate(resolved)
+                previous = self._repo.get_record(str(resolved))
+                previous_status = previous.last_status if previous else None
+
+                structurally_bad = validation.checked and not validation.is_valid
+                if structurally_bad and not force:
+                    outcomes.append(
+                        RebaselineOutcome(
+                            str(resolved), "refused", previous_status=previous_status,
+                            reason=validation.error_message or "format validation failed",
+                        )
+                    )
+                    continue
+
+                record = FileRecord(
+                    path_str=str(resolved),
+                    size_bytes=metrics.size_bytes,
+                    checksum=metrics.checksum,
+                    last_modified_ts=resolved.stat().st_mtime,
+                    is_corrupted=False,
+                    shannon_entropy=metrics.shannon_entropy,
+                    file_type=self._guess_file_type(resolved, validation),
+                    first_seen_ts=previous.first_seen_ts if previous else None,
+                    first_corrupt_ts=None,
+                    last_status="NEW_FILE",
+                    last_seen_ts=time.time(),
+                )
+                if not dry_run:
+                    self._repo.rebaseline_record(record)
+                outcomes.append(
+                    RebaselineOutcome(str(resolved), "rebaselined", previous_status=previous_status)
+                )
+
+        self._logger.info(
+            "rebaseline: %d accepted, %d refused, %d missing",
+            sum(1 for o in outcomes if o.ok),
+            sum(1 for o in outcomes if o.action == "refused"),
+            sum(1 for o in outcomes if o.action == "missing"),
+        )
+        return tuple(outcomes)
+
 
 # ==============================================================================
 # 7. PUBLIC FACADE
@@ -1557,6 +1769,18 @@ class CorruptionDetector:
     def restore_file(self, quarantine_path: FilePath, *, destination: FilePath | None = None) -> Path:
         return self._engine.restore_file(quarantine_path, destination=destination)
 
+    def rebaseline(
+        self,
+        targets: Sequence[FilePath],
+        *,
+        recursive: bool = True,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> tuple[RebaselineOutcome, ...]:
+        return self._engine.rebaseline(
+            targets, recursive=recursive, force=force, dry_run=dry_run
+        )
+
     def request_stop(self) -> None:
         self._engine.request_stop()
 
@@ -1578,6 +1802,7 @@ class CorruptionDetector:
             ),
             "FFmpeg (Media)": shutil.which("ffmpeg") is not None or shutil.which("ffprobe") is not None,
             "python-docx (Word)": importlib.util.find_spec("docx") is not None,
+            "python-pptx (PowerPoint)": importlib.util.find_spec("pptx") is not None,
             "openpyxl (Excel)": importlib.util.find_spec("openpyxl") is not None,
             "numpy (Math acceleration)": importlib.util.find_spec("numpy") is not None,
         }

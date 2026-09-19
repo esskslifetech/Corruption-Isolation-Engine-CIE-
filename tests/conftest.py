@@ -135,6 +135,21 @@ def make_real_docx(path: Path) -> Path:
     return path
 
 
+def make_real_pptx(path: Path) -> Path:
+    """A genuine PowerPoint package, built by python-pptx.
+
+    Hand-rolled zips with a ``ppt/presentation.xml`` member are *not* real
+    PPTX files; now that python-pptx validates PPTX packages, fixtures that
+    want "valid PPTX" have to be produced by the library.
+    """
+    pptx = pytest.importorskip("pptx")
+    presentation = pptx.Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+    slide.shapes.title.text = "CIE test deck"
+    presentation.save(path)
+    return path
+
+
 def make_real_tar(path: Path) -> Path:
     payload = b"tar payload\n" * 50
     with tarfile.open(path, "w") as archive:

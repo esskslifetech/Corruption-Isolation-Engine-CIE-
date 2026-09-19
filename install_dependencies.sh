@@ -93,6 +93,7 @@ modules = {
     "pypdf": ["pypdf", "PyPDF2"],          # either name satisfies the validator
     "python-docx": ["docx"],
     "openpyxl": ["openpyxl"],
+    "python-pptx": ["pptx"],              # optional: deeper PPTX validation
     "numpy": ["numpy"],
 }
 missing = []
@@ -104,7 +105,7 @@ for label, names in modules.items():
     found = next((n for n in names if importlib.util.find_spec(n)), None)
     print(f"  {label:<14}: {'OK (' + found + ')' if found else 'MISSING'}")
 
-missing = [m for m in missing if m != "numpy"]
+missing = [m for m in missing if m not in ("numpy", "python-pptx")]
 if missing:
     print("Missing required packages: " + ", ".join(missing), file=sys.stderr)
     raise SystemExit(1)
@@ -121,6 +122,17 @@ if "$PYTHON_BIN" cie.py --version >/dev/null 2>&1; then
 else
     echo "ERROR: 'python3 cie.py --version' failed - check the traceback above." >&2
     exit 1
+fi
+
+# The same check CI runs: a directory of known-good files must scan clean.
+if [ -d tests/fixtures ]; then
+    if "$PYTHON_BIN" cie.py --scan tests/fixtures --fail-on-findings \
+        --db-path /tmp/cie_install_check.db >/dev/null 2>&1; then
+        echo "Fixture scan       : OK (tests/fixtures scans clean)"
+    else
+        echo "WARNING: tests/fixtures did not scan clean - run 'python3 cie.py --scan tests/fixtures' to see why." >&2
+    fi
+    rm -f /tmp/cie_install_check.db /tmp/cie_install_check.db-wal /tmp/cie_install_check.db-shm
 fi
 
 echo

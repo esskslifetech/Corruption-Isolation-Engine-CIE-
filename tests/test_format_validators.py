@@ -300,3 +300,70 @@ def test_factory_and_adapter_return_the_same_result(tmp_path):
     from_adapter = FactoryBackedFormatValidator().validate(path)
     assert from_factory.is_valid == from_adapter.is_valid
     assert from_factory.format_name == from_adapter.format_name
+
+
+# ---------------------------------------------------------------------------
+# PPTX packages (python-pptx when available, structural checks otherwise)
+# ---------------------------------------------------------------------------
+
+def test_valid_pptx_passes(tmp_path):
+    from conftest import make_real_pptx
+
+    path = make_real_pptx(tmp_path / "deck.pptx")
+    result = validate_file(path)
+    assert result.is_valid is True, result.error_message
+
+
+def test_pptx_validation_uses_python_pptx_when_installed(tmp_path):
+    pytest.importorskip("pptx")
+    from conftest import make_real_pptx
+
+    result = validate_file(make_real_pptx(tmp_path / "deck.pptx"))
+    assert "pptx" in str(result.format_info.get("validator", "")).lower()
+
+
+def test_pptx_that_is_not_a_zip_is_rejected(tmp_path):
+    path = tmp_path / "broken.pptx"
+    path.write_bytes(b"this is not a zip file at all")
+    result = validate_file(path)
+    assert result.is_valid is False
+    assert "PPTX" in (result.error_message or "") or "ZIP" in (result.error_message or "").upper()
+
+
+def test_pptx_without_presentation_part_is_rejected(tmp_path):
+    path = tmp_path / "fake.pptx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("docProps/app.xml", "<Properties/>")
+    result = validate_file(path)
+    assert result.is_valid is False
+    assert "PPTX" in (result.error_message or "")
+
+
+def test_pptx_with_wrong_presentation_root_is_rejected(tmp_path):
+    path = tmp_path / "fake.pptx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("ppt/presentation.xml", "<notppt/>")
+    result = validate_file(path)
+    assert result.is_valid is False
+    # The generic message names the format; the detail says which part is wrong.
+    assert "PPTX" in (result.error_message or "")
+    assert any("presentation" in detail for detail in result.corruption_details), result.corruption_details
+
+
+def test_truncated_pptx_is_rejected(tmp_path):
+    from conftest import make_real_pptx
+
+    path = make_real_pptx(tmp_path / "deck.pptx")
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])
+    assert validate_file(path).is_valid is False
+
+
+def test_pptx_is_routed_to_its_own_format(tmp_path):
+    from conftest import make_real_pptx
+
+    result = validate_file(make_real_pptx(tmp_path / "deck.pptx"))
+    assert result.format_name == "PPTX"
+    assert result.format_info.get("checked") is True

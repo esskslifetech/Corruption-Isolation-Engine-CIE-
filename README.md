@@ -7,7 +7,7 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 > **Status note (audit revision).** The v2.0 tree shipped with a stdlib-shadowing
 > module name that broke every `cie.py` command, unit tests that called functions
 > which did not exist, and a requirements file that `pip` refused to install.
-> Those defects are fixed in this revision; `python3 -m pytest tests/` (186
+> Those defects are fixed in this revision; `python3 -m pytest tests/` (213
 > tests) and the CLI matrix in `docs/USER_GUIDE.md` pass, and the workflow in
 > `.github/workflows/ci.yml` re-checks all of it on a clean checkout. Measured detection
 > limits and the remaining known gaps are listed under
@@ -29,12 +29,15 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **Binary File Analysis**: Deep analysis of file structures and binary patterns
 - **Ransomware Detection**: Entropy-based heuristics for encrypted file detection
 - **Automatic Quarantine**: Option to automatically move corrupted files to quarantine
-- **Dual-Language Architecture**: Python for GUI and core logic, C++ for performance-critical operations
+- **Dual-Language Architecture**: Python for GUI, orchestration and verdicts, C++ for the
+  performance-critical hashing/metrics core. The Python engine calls the C++ core
+  through a C ABI shared library (`build/libcie_accel.so`); if the library is not
+  built, the identical pure-Python implementation is used automatically
 - **Comprehensive Reporting**: Detailed reports and statistics about file corruption in JSON or text format
 - **SQLite Database**: Persistent storage of file metadata and analysis history with WAL mode
 - **Cross-Platform Support**: Works on Linux, macOS, and Windows
 - **Concurrent Processing**: Multi-threaded scanning with configurable worker threads
-- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 186 pytest tests
+- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 213 pytest tests
 - **Continuous Integration**: the workflow in `.github/workflows/ci.yml` installs
   the dependencies, builds the C++ engine, runs the tests and scans a directory
   of known-good fixtures with `--fail-on-findings` on every push
@@ -54,7 +57,21 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **GUI Interface** (`src/gui/main_window.py`): User-friendly tkinter interface
 
 ### C++ Components
-- **File Analyzer** (`src/cpp/file_analyzer.cpp`): High-performance binary file analysis
+- **File Analyzer** (`src/cpp/file_analyzer.cpp`): High-performance binary file
+  analysis. Builds as the standalone `build/file_analyzer` CLI **and** as the
+  shared library `build/libcie_accel.so` (`make cpp` builds both).
+- **Acceleration shim** (`src/cpp/cie_accel.cpp`): the C ABI that the Python
+  engine loads with `ctypes` (`src/python/cpp_accel.py`). It `#include`s
+  `file_analyzer.cpp`, so the SHA-256 and byte-statistics code is shared - there
+  is exactly one implementation of each, in C++, and the Python module
+  `src/python/cpp_accel.py` is the binding, not a reimplementation.
+
+Python keeps control of I/O, chunking, cancellation and every verdict; the
+C++ core returns the SHA-256 digest plus `size`, `null/printable/unique` byte
+counts, the longest run and the Shannon entropy for the byte stream it is fed.
+`--library-status` reports which path would be used, `--no-cpp-accel` (or
+`"scanning": {"cpp_acceleration": false}` in the config file) forces the
+pure-Python path for a run.
 
 ## Installation
 
@@ -93,10 +110,13 @@ A powerful software tool for detecting, isolating, and separating corrupted file
    # Download from https://ffmpeg.org/download.html
    ```
 
-4. Compile the C++ module:
+4. Compile the C++ module (builds the standalone analyzer and the shared
+   library the Python engine uses):
    ```bash
    make cpp
    ```
+   This step is optional: without it the engine simply runs the pure-Python
+   hashing/metrics path, and `python3 cie.py --library-status` says so.
 
 5. Verify installation:
    ```bash
@@ -159,8 +179,11 @@ python3 cie.py --scan /path/to/directory --no-recursive
 
 #### Utility Commands
 ```bash
-# Check library availability
+# Check library availability (shows whether the C++ core is in use)
 python3 cie.py --library-status
+
+# Force the pure-Python hashing/metrics path for one run (no C++ library needed)
+python3 cie.py --scan /path/to/directory --no-cpp-accel
 
 # Run self-tests
 python3 cie.py --self-test
@@ -270,9 +293,11 @@ Corruption_isolation_engine/
 │   │   ├── format_validators.py      # File format validation
 │   │   ├── modular_scanner.py        # Advanced scanning strategies
 │   │   ├── processing_modules.py     # File processing pipeline
-│   │   └── cie_math.py               # Mathematical utilities
+│   │   ├── cie_math.py               # Mathematical utilities
+│   │   └── cpp_accel.py              # ctypes binding for build/libcie_accel.so
 │   ├── cpp/
-│   │   └── file_analyzer.cpp         # Optional high-performance analysis
+│   │   ├── file_analyzer.cpp         # High-performance analysis (standalone + core)
+│   │   └── cie_accel.cpp             # C ABI shim included by the Python engine
 │   └── gui/
 │       └── main_window.py            # Tkinter GUI
 ├── config/
@@ -324,13 +349,13 @@ make clean-quarantine
 # Full clean (including databases)
 make clean-all
 
-# Run tests (pytest, 186 tests)
+# Run tests (pytest, 213 tests)
 make test
 
 # Run the self-tests embedded in each module (no pytest needed)
 make test-selftest
 
-# Build the optional C++ helper
+# Build and self-test the C++ components (analyzer + acceleration library)
 make test-cpp
 
 # Quick scan helpers
@@ -394,6 +419,7 @@ The application can be configured through:
 | `scanning.skip_hidden_files` | inverse of `include_hidden_files` |
 | `scanning.follow_symlinks` | follow symlinks during collection |
 | `scanning.max_workers` | worker threads |
+| `scanning.cpp_acceleration` | use the C++ library for hashes/metrics when it is available (default `true`) |
 | `detection.checksum_algorithm` | `sha256` / `sha512` / `md5` / `blake2b` |
 | `detection.structure_validation_enabled` | enable library-backed validators |
 | `detection.ransomware_detection_enabled` | enable the entropy/extension heuristics |
@@ -413,8 +439,22 @@ The application uses SQLite with two main tables:
 
 ## Performance
 
-Measured by the audit (20.04 MB/s for the Python engine on a 10,000-file
-corpus; the C++ helper reached 107.3 MB/s but is not wired into the engine):
+Measured on a 100 MB corpus of 20 random 5 MB files (`audit/probe7_perf.py`,
+same machine, same run):
+
+| Path | Throughput |
+|------|-----------|
+| Python engine, C++ acceleration active (default after `make cpp`) | ~150 MB/s |
+| Python engine, pure Python (`--no-cpp-accel`) | ~17-21 MB/s |
+| Standalone C++ analyzer `build/file_analyzer` (reference; it also classifies
+  every file and renders a report, so it is not the same workload) | ~100 MB/s |
+
+Accelerating the hashing/metrics stage is worth roughly **8-9x** on payload-heavy
+scans; everything else (format validation, database writes, reporting) is
+unchanged. On the earlier 10,000-file corpus the engine measured 20.04 MB/s -
+that figure describes the pure-Python path.
+
+Other notes:
 
 - **Modular Scanner**: fast / balanced / deep strategies, same verdicts on the
   same files; "fast" reduces *file collection* work, not validation depth
@@ -454,7 +494,7 @@ openpyxl 3.1.5, python-pptx 1.0.2, numpy 2.3.5 and pytest 9.0.3 installed,
 
 | Check | Result |
 |-------|--------|
-| pytest suite | 186 passed |
+| pytest suite | 213 passed |
 | CLI commands (`--version`, `--library-status`, `--self-test`, `--scan`, `--modular-scan`, `--fast-scan`, `--list-quarantine`, `--restore`) | all exit 0 |
 | Recall, formats with integrity metadata | 9/9 |
 | Recall, same-size damage found on a *second* scan (baseline) | 12/12 |
@@ -471,8 +511,11 @@ Known limitations, stated rather than hidden:
 - Text in non-UTF-8 legacy encodings (e.g. `Big5`, `KOI8-R`, `Latin-1` bytes)
   can still be reported as undecodable text - it is reported as a warning, not
   quarantined automatically.
-- The C++ helper (`src/cpp/file_analyzer.cpp`) is not called by the Python
-  engine; it remains a standalone experimental tool.
+- The C++ core accelerates hashing/metrics only. Format validation, parsing and
+  every verdict stay in Python, so the end-to-end speed-up is concentrated on
+  large binary payloads rather than on metadata-heavy scans. The C++ code is used
+  by the Python engine (see `src/python/cpp_accel.py`), not a separate unused
+  artifact.
 - Multi-threaded scanning does not measurably speed up I/O-bound scans.
 
 ## License
@@ -491,6 +534,9 @@ license is intended.)
 
 2. **C++ compilation errors**: Ensure g++ supports C++20
    - Update compiler: `sudo apt-get install g++`
+   - A failed or skipped build does not break the tool: the engine logs the
+     reason once and falls back to pure-Python hashing/metrics. Check with
+     `python3 cie.py --library-status`.
 
 3. **Permission errors**: Ensure read access to target directories
 

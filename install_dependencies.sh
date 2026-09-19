@@ -135,6 +135,14 @@ if [ -d tests/fixtures ]; then
     rm -f /tmp/cie_install_check.db /tmp/cie_install_check.db-wal /tmp/cie_install_check.db-shm
 fi
 
+# The Python engine uses the C++ core for hashing/metrics when it is built.
+echo
+if [ -f build/libcie_accel.so ] || [ -f build/libcie_accel.dylib ]; then
+    echo "C++ acceleration   : OK (build/libcie_accel.*) - used by the Python engine"
+else
+    echo "C++ acceleration   : not built - run 'make cpp' for ~4x faster hashing"
+fi
+
 echo
 echo "Setup complete."
 echo "  Scan a folder : python3 cie.py --scan /path/to/data"

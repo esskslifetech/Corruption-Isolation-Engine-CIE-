@@ -1867,6 +1867,11 @@ void print_usage(const char* program_name) {
 // ============================================================================
 // 10. MAIN
 // ============================================================================
+// Wrapped so that the same translation unit can also be compiled into the
+// Python acceleration library (src/cpp/cie_accel.cpp defines CIE_ACCEL_LIBRARY):
+// the library reuses crypto::Sha256 and metrics::ByteStatistics from this file
+// instead of maintaining a second, divergent implementation.
+#ifndef CIE_ACCEL_LIBRARY
 int main(int argc, char* argv[]) {
     const auto config_result = parse_arguments(argc, argv);
     if (!config_result) {
@@ -1923,3 +1928,5 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
+#endif // CIE_ACCEL_LIBRARY

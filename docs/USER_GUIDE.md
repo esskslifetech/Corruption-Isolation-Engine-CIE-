@@ -22,7 +22,8 @@ This guide helps users get the most out of the Corruption Isolation Engine (CIE)
    ./install_dependencies.sh
    ```
 
-2. **Compile C++ Module**
+2. **Compile C++ Module** (optional but recommended; builds the standalone
+   analyzer *and* the shared library the Python engine hashes with)
    ```bash
    make cpp
    ```
@@ -155,6 +156,16 @@ python3 cie.py --fast-scan /path/to/directory
 ```bash
 python3 cie.py --library-status
 ```
+The listing includes a **C++ acceleration (hashes/metrics)** row: `Available`
+when `build/libcie_accel.so` was found and loaded, otherwise the tool runs the
+pure-Python implementation with no loss of accuracy.
+
+#### Disable C++ Acceleration
+```bash
+python3 cie.py --scan /path/to/directory --no-cpp-accel
+```
+Useful when comparing backends or debugging; equivalent config key:
+`"scanning": {"cpp_acceleration": false}`.
 
 #### Run Self-Tests
 ```bash

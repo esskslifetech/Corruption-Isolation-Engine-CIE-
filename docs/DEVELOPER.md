@@ -130,10 +130,16 @@ CIE follows a modular architecture with clear separation of concerns:
 - Binary pattern analysis
 - Statistical operations
 
-#### 5. C++ Module (`src/cpp/file_analyzer.cpp`)
-- High-performance binary analysis
-- Low-level file operations
-- Performance-critical algorithms
+#### 5. C++ Modules (`src/cpp/`)
+- `file_analyzer.cpp` - high-performance binary analysis (SHA-256, byte
+  statistics, entropy); builds as the standalone `build/file_analyzer` CLI
+- `cie_accel.cpp` - the C ABI shim the Python engine loads with `ctypes`; it
+  `#include`s `file_analyzer.cpp`, so both binaries share one implementation
+- Bound from Python by `src/python/cpp_accel.py` (`AccelHasher`, `hash_bytes`,
+  `AccelStats`); `make cpp` builds both artifacts
+- The engine keeps I/O, chunking and cancellation in Python; the C++ side only
+  computes hashes/metrics. If the library is missing the engine logs once and
+  uses the pure-Python path (`--no-cpp-accel` forces that path)
 
 ## Code Organization
 
@@ -147,10 +153,11 @@ src/
 │   ├── format_validators.py      # File validators
 │   ├── processing_modules.py     # Processing pipeline
 │   ├── cie_math.py                # Math utilities
-│   └── modular_scanner.py        # Advanced scanning
+   ├── modular_scanner.py          # Advanced scanning
+   └── cpp_accel.py                # ctypes binding to libcie_accel
 ├── cpp/
-│   ├── file_analyzer.cpp         # C++ analyzer
-│   └── (future C++ modules)
+│   ├── file_analyzer.cpp         # C++ analyzer (standalone CLI + core)
+│   └── cie_accel.cpp             # C ABI shim loaded by the engine
 └── gui/
     ├── __init__.py
     └── main_window.py            # Tkinter GUI
@@ -424,7 +431,7 @@ tests/
 └── test_cli.py                  # end-to-end CLI: scan, JSON, exit codes, quarantine, rebaseline
 ```
 
-Run them with `make test`, or `python3 -m pytest tests/ -q` (186 tests).
+Run them with `make test`, or `python3 -m pytest tests/ -q` (213 tests).
 
 ### Continuous Integration
 

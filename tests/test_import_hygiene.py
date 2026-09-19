@@ -91,7 +91,10 @@ def test_modules_import_from_source_directory_directly():
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("module", ["core_analyzer", "processing_modules", "format_validators", "cie_math"])
+@pytest.mark.parametrize(
+    "module",
+    ["core_analyzer", "processing_modules", "format_validators", "cie_math", "cpp_accel"],
+)
 def test_module_selftest_suites_pass(module: str):
     """Every module with a __main__ self-test block must pass it."""
     result = run_python(f"{module}.py", cwd=PY_SRC)

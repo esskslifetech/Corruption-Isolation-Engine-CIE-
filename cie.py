@@ -483,6 +483,7 @@ def build_detector(runtime: RuntimeBundle, args: argparse.Namespace) -> Any:
             False if args.disable_ransomware_detection else None
         ),
         "advanced_validators": False if getattr(args, "no_deep_validation", False) else None,
+        "use_cpp_accel": False if getattr(args, "no_cpp_accel", False) else None,
     }
 
     if config_from_mapping is not None:
@@ -700,6 +701,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-deep-validation",
         action="store_true",
         help="use header/signature checks only (skip Pillow/PyPDF2/openpyxl/ffprobe)",
+    )
+    parser.add_argument(
+        "--no-cpp-accel",
+        action="store_true",
+        help="do not use the C++ core (build/libcie_accel.so) for hashing/metrics",
     )
     parser.add_argument(
         "--rebaseline-force",

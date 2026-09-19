@@ -126,6 +126,36 @@ Configuration class for the analyzer.
 - `exclude_quarantine_from_scans` (bool): Exclude quarantine from scans (default: True)
 - `follow_symlinks` (bool): Follow symbolic links (default: False)
 - `include_hidden_files` (bool): Include hidden files (default: True)
+- `advanced_validators` (bool): Use the format validators (default: True)
+- `entropy_jump_threshold` (float): Entropy jump that marks a suspicion (default: 2.0)
+- `use_cpp_accel` (bool): Use the C++ library for hashes/metrics when it is
+  loaded (default: True). Ignored for non-`sha256` algorithms, which always use
+  the pure-Python path. Check the active path with
+  `AdvancedFileMetricsCalculator(config).backend` (`"cpp"` or `"python"`).
+
+### C++ Acceleration
+
+`src/python/cpp_accel.py` binds `build/libcie_accel.so` (built by `make cpp`):
+
+```python
+from cpp_accel import available, selftest, hash_bytes, AccelHasher
+
+available()              # True when the shared library was found and loaded
+selftest()               # 0 = the library's own SHA-256 entropy self-test passed
+hash_bytes(b"payload")   # AccelStats(size_bytes, sha256, shannon_entropy, ...)
+
+with AccelHasher() as hasher:
+    hasher.update(b"chunk 1")
+    hasher.update(b"chunk 2")
+    stats = hasher.finish()      # same fields, streamed
+```
+
+`AccelStats` carries `size_bytes`, `sha256`, `shannon_entropy`, `null_bytes`,
+`printable_bytes`, `unique_bytes` and `max_run_length`. Nothing here raises on
+import: `available()` just returns `False` when the library is absent, and the
+engine then falls back to the pure-Python implementation (logged once).
+Environment overrides: `CIE_ACCEL_LIBRARY` (explicit path) and
+`CIE_ACCEL_BUILD_DIR` (directory holding the library).
 
 ## Data Models
 
@@ -286,53 +316,31 @@ The application can be configured using `config/cie_config.json`:
 
 ```json
 {
-  "database": {
-    "path": "cie_database.db",
-    "backup_enabled": true,
-    "backup_interval_hours": 24
-  },
+  "database": { "path": "cie_database.db" },
   "scanning": {
-    "default_recursive": true,
-    "chunk_size": 4096,
-    "max_file_size_mb": 1024,
-    "skip_hidden_files": true,
-    "skip_system_files": true
+    "chunk_size": 262144,
+    "skip_hidden_files": false,
+    "follow_symlinks": false,
+    "max_workers": 0,
+    "cpp_acceleration": true
   },
-  "quarantine": {
-    "directory": "quarantine",
-    "auto_cleanup_days": 30,
-    "max_quarantine_size_gb": 10,
-    "compression_enabled": false
-  },
+  "quarantine": { "directory": "quarantine" },
   "detection": {
     "checksum_algorithm": "sha256",
-    "binary_analysis_enabled": true,
     "structure_validation_enabled": true,
-    "null_byte_threshold": 0.5,
-    "pattern_detection_enabled": true
+    "ransomware_detection_enabled": true,
+    "entropy_threshold": 7.95,
+    "entropy_jump_threshold": 2.0
   },
-  "gui": {
-    "theme": "default",
-    "window_width": 1000,
-    "window_height": 700,
-    "auto_refresh": false,
-    "show_hidden_files": false
-  },
-  "logging": {
-    "level": "INFO",
-    "file": "cie.log",
-    "max_size_mb": 10,
-    "backup_count": 5
-  },
-  "file_types": {
-    "image_extensions": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"],
-    "document_extensions": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".rtf"],
-    "archive_extensions": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"],
-    "database_extensions": [".db", ".sqlite", ".sqlite3", ".mdb"],
-    "binary_extensions": [".exe", ".dll", ".so", ".dylib", ".bin"]
-  }
+  "_advisory": { "gui": { "theme": "default" }, "logging": { "level": "INFO" } }
 }
 ```
+
+This mirrors `config/cie_config.json`, which is the file the engine actually
+reads (`config_from_mapping`). Keys under `_advisory` are documentation only -
+the engine has no theme or log-rotation support - and unknown keys are ignored
+with a warning, so a hand-edited file cannot break a scan. `max_workers: 0`
+means "choose automatically". Precedence: **CLI flag > config file > default**.
 
 ## Database Schema
 
@@ -342,17 +350,23 @@ Stores file analysis results.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| id | INTEGER | Primary key |
-| file_path | TEXT | File path |
-| file_size | INTEGER | File size in bytes |
+| file_path | TEXT | File path (primary key) |
+| size_bytes | INTEGER | File size in bytes |
+| checksum | TEXT | Checksum of the trusted baseline content |
+| last_modified | REAL | mtime of the baseline |
+| is_corrupted | INTEGER | 0/1 - whether the file is currently flagged |
+| shannon_entropy | REAL | Entropy of the baseline content |
 | file_type | TEXT | Detected file type |
-| checksum | TEXT | SHA-256 checksum |
-| is_corrupted | BOOLEAN | Whether file is corrupted |
-| status | TEXT | Analysis status |
-| error_message | TEXT | Error message |
-| shannon_entropy | REAL | Shannon entropy |
-| created_at | TIMESTAMP | Creation timestamp |
-| updated_at | TIMESTAMP | Last update timestamp |
+| analysis_date | TEXT | Timestamp of the last analysis |
+| first_seen | REAL | When the path was first scanned |
+| first_corrupt | REAL | When it was first flagged as corrupted |
+| last_status | TEXT | Last status string (e.g. `VALID`, `CORRUPTED_FORMAT`) |
+| last_seen | REAL | When the path was last seen |
+
+`size_bytes`, `checksum`, `last_modified` and `shannon_entropy` describe the
+trusted baseline and are **not** overwritten while the file stays flagged, so a
+damaged file keeps being reported on later scans. New columns are added by
+`_migrate()` with `ALTER TABLE`, so existing databases keep working.
 
 ### quarantine_log Table
 
@@ -362,11 +376,10 @@ Tracks quarantined files.
 |--------|------|-------------|
 | id | INTEGER | Primary key |
 | original_path | TEXT | Original file path |
-| quarantine_path | TEXT | Quarantine file path |
-| file_size | INTEGER | File size in bytes |
-| checksum | TEXT | File checksum |
-| quarantine_reason | TEXT | Reason for quarantine |
-| created_at | TIMESTAMP | Quarantine timestamp |
+| quarantine_path | TEXT | File path inside the quarantine directory |
+| reason | TEXT | Why the file was quarantined |
+| action_date | TEXT | When it was quarantined |
+| restored_at | TEXT | When it was restored (`NULL` while quarantined) |
 
 ## Performance Considerations
 

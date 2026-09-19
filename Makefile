@@ -13,6 +13,12 @@ CXX        ?= g++
 CXXFLAGS   ?= -std=c++20 -Wall -Wextra -O2
 CPP_SOURCE  = src/cpp/file_analyzer.cpp
 CPP_TARGET  = build/file_analyzer
+# Python-facing C ABI core loaded by src/python/cpp_accel.py (ctypes). It reuses
+# the SHA-256 and byte statistics from file_analyzer.cpp, so the two cannot
+# drift apart; when it is absent the Python engine falls back to a pure-Python
+# metrics pass automatically.
+ACCEL_SOURCE = src/cpp/cie_accel.cpp
+ACCEL_TARGET = build/libcie_accel.so
 
 PYTHON      ?= python3
 CIE_CLI      = cie.py
@@ -49,12 +55,18 @@ scan-fast:
 # ---------------------------------------------------------------------------
 # C++ helper (optional: the shipped engine is pure Python)
 # ---------------------------------------------------------------------------
-cpp: $(CPP_TARGET)
+cpp: $(CPP_TARGET) $(ACCEL_TARGET)
 
 $(CPP_TARGET): $(CPP_SOURCE)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(CPP_SOURCE) -o $(CPP_TARGET)
 	@echo "C++ module compiled -> $(CPP_TARGET)"
+
+# The acceleration library is what the Python engine actually calls.
+$(ACCEL_TARGET): $(ACCEL_SOURCE) $(CPP_SOURCE)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -fPIC -shared -fvisibility=hidden $(ACCEL_SOURCE) -o $(ACCEL_TARGET)
+	@echo "C++ acceleration library -> $(ACCEL_TARGET) (used by the Python engine)"
 
 run-cpp: $(CPP_TARGET)
 	@test -n "$(DIR)" || { echo "usage: make run-cpp DIR=/path/to/data"; exit 2; }
@@ -140,7 +152,7 @@ help:
 	@echo "  check            - run the entry-point sanity check"
 	@echo "  scan DIR=...     - full corrupting-file scan of DIR"
 	@echo "  scan-fast DIR=.. - fast signature-only modular scan of DIR"
-	@echo "  cpp              - compile the optional C++ helper"
+	@echo "  cpp              - compile the C++ analyzer + acceleration library"
 	@echo "  run-cpp DIR=...  - run the optional C++ helper"
 	@echo "  gui              - launch the Tk GUI"
 	@echo "  install          - install Python dependencies"

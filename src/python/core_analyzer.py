@@ -71,6 +71,10 @@ class AnalyzerConfig:
     # Treat a file's own entropy as suspicious only when it has *changed*
     # relative to the recorded baseline by at least this many bits/byte.
     entropy_jump_threshold: float = 2.0
+    # Use the C++ core (build/libcie_accel.so, built by `make cpp`) for the
+    # per-byte SHA-256 + histogram pass when it is available. Identical results;
+    # roughly 5x the throughput. Falls back to pure Python automatically.
+    use_cpp_accel: bool = True
 
 
 # ------------------------------------------------------------------------------
@@ -139,6 +143,8 @@ def config_from_mapping(data: Mapping[str, Any] | None, **overrides: Any) -> "An
         defaults["entropy_jump_threshold"] = float(detection["entropy_jump_threshold"])
     if scanning.get("follow_symlinks") is not None:
         defaults["follow_symlinks"] = bool(scanning["follow_symlinks"])
+    if scanning.get("cpp_acceleration") is not None:
+        defaults["use_cpp_accel"] = bool(scanning["cpp_acceleration"])
     if scanning.get("max_workers"):
         # 0 (or negative) means "pick automatically", never a zero-sized pool.
         max_workers = int(scanning["max_workers"])
@@ -808,8 +814,90 @@ class AdvancedFileMetricsCalculator(IMetricsCalculator):
         self._chunk_size = max(1, config.chunk_size)
         self._hash_algorithm = config.hash_algorithm
         hashlib.new(self._hash_algorithm)
+        # The C++ core implements SHA-256 only; anything else stays in Python.
+        requested = bool(getattr(config, "use_cpp_accel", True))
+        self._use_cpp_accel = requested and self._hash_algorithm.lower() == "sha256"
+        self._accel_module: Any | None = None
+        self._accel_checked = False
+        self._accel_failed = False
+
+    # -- C++ core ----------------------------------------------------------
+
+    def _accel(self) -> Any | None:
+        """The cpp_accel module when usable, else None (checked once)."""
+        if self._accel_checked:
+            return None if self._accel_failed else self._accel_module
+
+        self._accel_checked = True
+        if not self._use_cpp_accel:
+            self._accel_failed = True
+            return None
+
+        try:
+            module = load_sibling_module("cpp_accel")
+            if not module.available():
+                raise RuntimeError(module.unavailable_reason() or "unavailable")
+        except Exception as exc:  # missing build, ABI mismatch, unreadable path
+            LOGGER.debug("C++ acceleration disabled: %s", exc)
+            self._accel_failed = True
+            return None
+
+        self._accel_module = module
+        return module
+
+    @property
+    def backend(self) -> str:
+        """``"cpp"`` when the C++ core is in use, else ``"python"``."""
+        return "cpp" if self._accel() is not None else "python"
+
+    def _calculate_with_accel(
+        self,
+        module: Any,
+        path: Path,
+        cancel_event: threading.Event | None,
+    ) -> FileMetrics:
+        """Same contract as calculate(), with the per-byte work done in C++."""
+        try:
+            with module.AccelHasher() as hasher:
+                with path.open("rb") as handle:
+                    while True:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise ScanCancelledError(f"scan cancelled while reading {path}")
+
+                        chunk = handle.read(self._chunk_size)
+                        if not chunk:
+                            break
+
+                        hasher.update(chunk)
+
+                stats = hasher.finish()
+        except OSError as exc:
+            raise FileAccessError(f"failed to read file metrics for {path}: {exc}") from exc
+
+        return FileMetrics(
+            size_bytes=stats.size_bytes,
+            checksum=stats.sha256,
+            shannon_entropy=stats.shannon_entropy,
+        )
+
+    # -- pure Python -------------------------------------------------------
 
     def calculate(self, path: Path, cancel_event: threading.Event | None = None) -> FileMetrics:
+        accel = self._accel()
+        if accel is not None:
+            try:
+                return self._calculate_with_accel(accel, path, cancel_event)
+            except ScanCancelledError:
+                raise
+            except Exception as exc:
+                # A broken/unloadable library must never break a scan: report it
+                # once and keep going with the pure-Python implementation.
+                LOGGER.warning("C++ acceleration failed (%s); falling back to Python for this scan", exc)
+                self._accel_failed = True
+
+        return self._calculate_python(path, cancel_event)
+
+    def _calculate_python(self, path: Path, cancel_event: threading.Event | None = None) -> FileMetrics:
         histogram = [0] * 256
         total_bytes = 0
         hasher = hashlib.new(self._hash_algorithm)
@@ -1678,6 +1766,14 @@ class CorruptionEngine:
 _SIBLING_MODULES: dict[str, ModuleType] = {}
 
 
+def cpp_accel_available() -> bool:
+    """True when build/libcie_accel.so is loadable (built by `make cpp`)."""
+    try:
+        return bool(load_sibling_module("cpp_accel").available())
+    except Exception:
+        return False
+
+
 def load_sibling_module(name: str) -> ModuleType:
     """Import a module that sits next to this file, by path.
 
@@ -1805,6 +1901,7 @@ class CorruptionDetector:
             "python-pptx (PowerPoint)": importlib.util.find_spec("pptx") is not None,
             "openpyxl (Excel)": importlib.util.find_spec("openpyxl") is not None,
             "numpy (Math acceleration)": importlib.util.find_spec("numpy") is not None,
+            "C++ acceleration (hashes/metrics)": cpp_accel_available(),
         }
 
 

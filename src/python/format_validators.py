@@ -21,8 +21,9 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
@@ -38,12 +39,22 @@ except ImportError:  # pragma: no cover
     UnidentifiedImageError = Exception  # type: ignore[assignment]
     PILLOW_AVAILABLE = False
 
+# pypdf is the maintained successor of PyPDF2; accept either import name so
+# `pip install pypdf` (what requirements.txt asks for) actually enables the
+# library-backed PDF check.
 try:
-    import PyPDF2
+    import pypdf as PyPDF2  # type: ignore[import-not-found,no-redef]
     PYPDF2_AVAILABLE = True
+    PDF_LIBRARY_NAME = "pypdf"
 except ImportError:  # pragma: no cover
-    PyPDF2 = None  # type: ignore[assignment]
-    PYPDF2_AVAILABLE = False
+    try:
+        import PyPDF2  # type: ignore[no-redef]
+        PYPDF2_AVAILABLE = True
+        PDF_LIBRARY_NAME = "PyPDF2"
+    except ImportError:
+        PyPDF2 = None  # type: ignore[assignment]
+        PYPDF2_AVAILABLE = False
+        PDF_LIBRARY_NAME = None
 
 try:
     import docx
@@ -62,6 +73,33 @@ except ImportError:  # pragma: no cover
 FFPROBE_AVAILABLE = shutil.which("ffprobe") is not None
 
 
+# Human-readable names per extension. Used for reporting; unknown extensions
+# fall back to the uppercased suffix so callers always get a stable label.
+FORMAT_NAMES: dict[str, str] = {
+    ".pdf": "PDF", ".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".gif": "GIF",
+    ".bmp": "BMP", ".tiff": "TIFF", ".tif": "TIFF", ".webp": "WebP", ".ico": "ICO",
+    ".zip": "ZIP", ".jar": "JAR", ".apk": "APK", ".docx": "DOCX", ".xlsx": "XLSX",
+    ".pptx": "PPTX", ".odt": "ODT", ".ods": "ODS", ".doc": "DOC", ".xls": "XLS",
+    ".ppt": "PPT", ".exe": "PE", ".dll": "PE", ".elf": "ELF", ".so": "ELF",
+    ".mp4": "MP4", ".mov": "MOV", ".mkv": "Matroska", ".webm": "WebM",
+    ".avi": "AVI", ".mp3": "MP3", ".wav": "WAV", ".flac": "FLAC", ".ogg": "OGG",
+    ".opus": "Opus", ".aac": "AAC", ".m4a": "M4A", ".txt": "Text", ".csv": "CSV",
+    ".json": "JSON", ".xml": "XML", ".md": "Markdown", ".log": "Log",
+    ".gz": "GZip", ".bz2": "BZip2", ".xz": "XZ", ".zst": "Zstandard",
+    ".7z": "7-Zip", ".rar": "RAR", ".tar": "TAR", ".sqlite": "SQLite",
+    ".sqlite3": "SQLite", ".db": "SQLite", ".iso": "ISO", ".img": "DiskImage",
+    ".gpg": "GnuPG", ".kdbx": "KeePass", ".heic": "HEIC", ".avif": "AVIF",
+}
+
+
+def format_name_for(extension: str) -> str:
+    """Best-effort display name for an extension ('' -> 'Unknown')."""
+    normalized = extension.lower()
+    if not normalized:
+        return "Unknown"
+    return FORMAT_NAMES.get(normalized, normalized.lstrip(".").upper())
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationResult:
     """Immutable file validation result."""
@@ -70,6 +108,12 @@ class ValidationResult:
     error_message: str | None = None
     format_info: dict[str, Any] = field(default_factory=dict)
     corruption_details: tuple[str, ...] = field(default_factory=tuple)
+    format_name: str | None = None
+
+    @property
+    def checked(self) -> bool:
+        """True when a validator actually inspected the content (not 'unknown type')."""
+        return bool(self.format_info.get("checked", False))
 
     @classmethod
     def ok(
@@ -77,12 +121,14 @@ class ValidationResult:
         *,
         format_info: dict[str, Any] | None = None,
         corruption_details: Iterable[str] = (),
+        format_name: str | None = None,
     ) -> "ValidationResult":
         return cls(
             is_valid=True,
             error_message=None,
             format_info=dict(format_info or {}),
             corruption_details=tuple(corruption_details),
+            format_name=format_name,
         )
 
     @classmethod
@@ -92,12 +138,14 @@ class ValidationResult:
         *,
         format_info: dict[str, Any] | None = None,
         corruption_details: Iterable[str] = (),
+        format_name: str | None = None,
     ) -> "ValidationResult":
         return cls(
             is_valid=False,
             error_message=error_message,
             format_info=dict(format_info or {}),
             corruption_details=tuple(corruption_details),
+            format_name=format_name,
         )
 
     @classmethod
@@ -106,6 +154,7 @@ class ValidationResult:
         *,
         reason: str,
         format_info: dict[str, Any] | None = None,
+        format_name: str | None = None,
     ) -> "ValidationResult":
         payload = dict(format_info or {})
         payload["checked"] = False
@@ -115,6 +164,7 @@ class ValidationResult:
             error_message=None,
             format_info=payload,
             corruption_details=(),
+            format_name=format_name,
         )
 
 
@@ -153,38 +203,225 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _iso_bmff_boxes(prefix: bytes, limit: int = 24) -> list[tuple[int, bytes]]:
+    """Walk the top level of an ISO base media file (MP4/MOV/HEIC).
+
+    Returns [(offset, box_type), ...]. Many real recordings start with a `free`
+    or `wide` box *before* `ftyp`, so checking offset 4 for b"ftyp" is wrong.
+    """
+    boxes: list[tuple[int, bytes]] = []
+    offset = 0
+    total = len(prefix)
+
+    while offset + 8 <= total and len(boxes) < limit:
+        size = int.from_bytes(prefix[offset:offset + 4], "big")
+        box_type = prefix[offset + 4:offset + 8]
+        boxes.append((offset, box_type))
+
+        if size == 0:            # box extends to EOF
+            break
+        if size == 1:            # 64-bit size follows the type
+            if offset + 16 > total:
+                break
+            size = int.from_bytes(prefix[offset + 8:offset + 16], "big")
+        if size < 8:             # malformed
+            break
+        offset += size
+
+    return boxes
+
+
+class IsoBmffValidator:
+    """MP4/MOV/3GP container validation via box walking."""
+
+    _VALID_BRANDS = (
+        b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42",
+        b"avc1", b"dash", b"M4V ", b"M4A ", b"3gp4", b"3gp5", b"qt  ",
+        b"heic", b"heix", b"mif1", b"avif",
+    )
+
+    def validate(self, file_path: FilePath) -> ValidationResult:
+        path = _path(file_path)
+        extension = path.suffix.lower()
+        format_name = format_name_for(extension)
+
+        try:
+            prefix = _read_prefix(path, 4096)
+        except OSError as exc:
+            return ValidationResult.invalid(
+                f"failed to read media header: {exc}",
+                format_info={"extension": extension, "validator": "iso-bmff"},
+                format_name=format_name,
+            )
+
+        boxes = _iso_bmff_boxes(prefix)
+        types = [box_type for _, box_type in boxes]
+
+        if b"ftyp" not in types:
+            return ValidationResult.invalid(
+                f"missing {format_name} ftyp box",
+                format_info={
+                    "extension": extension, "validator": "iso-bmff", "checked": True,
+                    "leading_boxes": [t.decode("latin-1") for t in types[:6]],
+                },
+                corruption_details=("no ISO base media ftyp box found in the first boxes",),
+                format_name=format_name,
+            )
+
+        ftyp_index = types.index(b"ftyp")
+        ftyp_offset = boxes[ftyp_index][0]
+        brand = prefix[ftyp_offset + 8:ftyp_offset + 12]
+        leading = [t.decode("latin-1") for t in types[:ftyp_index]]
+
+        if brand not in self._VALID_BRANDS and not brand.startswith(b"iso"):
+            return ValidationResult.invalid(
+                f"unrecognised {format_name} brand: {brand!r}",
+                format_info={
+                    "extension": extension, "validator": "iso-bmff", "checked": True,
+                    "brand": brand.decode("latin-1", "replace"), "leading_boxes": leading,
+                },
+                corruption_details=(f"brand {brand!r} is not a known ISO base media brand",),
+                format_name=format_name,
+            )
+
+        return ValidationResult.ok(
+            format_info={
+                "extension": extension, "validator": "iso-bmff", "checked": True,
+                "brand": brand.decode("latin-1", "replace"),
+                "leading_boxes": leading,
+                "has_mdat": b"mdat" in types,
+            },
+            format_name=format_name,
+        )
+
+
+class JpegValidator:
+    """JPEG validation that tolerates trailing bytes after EOI (very common)."""
+
+    _TAIL_WINDOW = 64 * 1024
+
+    def validate(self, file_path: FilePath) -> ValidationResult:
+        path = _path(file_path)
+        format_name = "JPEG"
+        try:
+            size = path.stat().st_size
+            prefix = _read_prefix(path, 3)
+            # scan the whole file when small, otherwise the last 64 KB
+            suffix = _read_suffix(path, min(self._TAIL_WINDOW, size))
+        except OSError as exc:
+            return ValidationResult.invalid(
+                f"failed to read JPEG: {exc}",
+                format_info={"validator": "jpeg"},
+                format_name=format_name,
+            )
+
+        issues: list[str] = []
+        if not prefix.startswith(b"\xff\xd8\xff"):
+            issues.append("missing JPEG SOI marker")
+        if b"\xff\xd9" not in suffix:
+            issues.append("missing JPEG EOI marker")
+
+        if issues:
+            return ValidationResult.invalid(
+                "invalid JPEG structure",
+                format_info={
+                    "extension": path.suffix.lower(), "validator": "jpeg",
+                    "checked": True, "size": size,
+                },
+                corruption_details=tuple(issues),
+                format_name=format_name,
+            )
+
+        # note trailing padding but do not treat it as corruption
+        last_eoi = suffix.rfind(b"\xff\xd9")
+        trailing = (len(suffix) - (last_eoi + 2)) if last_eoi >= 0 and size > len(suffix) else 0
+        warnings = []
+        if last_eoi >= 0 and last_eoi + 2 < len(suffix):
+            warnings.append("trailing bytes after EOI marker")
+
+        return ValidationResult.ok(
+            format_info={
+                "extension": path.suffix.lower(), "validator": "jpeg", "checked": True,
+                "size": size, "trailing_bytes": max(0, trailing), "warnings": warnings,
+            },
+            format_name=format_name,
+        )
+
+
 class MagicSignatureValidator:
-    """Fallback validator using structural signatures."""
+    """Fallback validator using structural signatures.
+
+    Signatures are (offset, bytes) tuples. Every entry is verified against real
+    files in tests/test_validators.py; formats whose layouts cannot be checked
+    with a fixed offset (MP4/MOV, JPEG, PDF tails) get a dedicated validator.
+    """
 
     _SIGNATURES: dict[str, tuple[tuple[int, bytes], ...]] = {
+        # --- images ---
         ".png": ((0, b"\x89PNG\r\n\x1a\n"),),
         ".jpg": ((0, b"\xff\xd8\xff"),),
         ".jpeg": ((0, b"\xff\xd8\xff"),),
         ".gif": ((0, b"GIF87a"), (0, b"GIF89a")),
         ".bmp": ((0, b"BM"),),
         ".tiff": ((0, b"II*\x00"), (0, b"MM\x00*")),
+        ".tif": ((0, b"II*\x00"), (0, b"MM\x00*")),
         ".webp": ((0, b"RIFF"), (8, b"WEBP")),
         ".ico": ((0, b"\x00\x00\x01\x00"),),
+        ".heic": ((4, b"ftypheic"), (4, b"ftypheix"), (4, b"ftypmif1")),
+        ".avif": ((4, b"ftypavif"),),
+        # --- documents / containers ---
         ".pdf": ((0, b"%PDF-"),),
         ".zip": ((0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")),
         ".jar": ((0, b"PK\x03\x04"),),
         ".apk": ((0, b"PK\x03\x04"),),
+        ".docx": ((0, b"PK\x03\x04"),),
+        ".xlsx": ((0, b"PK\x03\x04"),),
+        ".pptx": ((0, b"PK\x03\x04"),),
+        ".odt": ((0, b"PK\x03\x04"),),
+        ".ods": ((0, b"PK\x03\x04"),),
+        # OLE2 compound files: legacy .doc/.xls/.ppt
+        ".doc": ((0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),),
+        ".xls": ((0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),),
+        ".ppt": ((0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),),
+        # --- executables ---
         ".exe": ((0, b"MZ"),),
+        ".dll": ((0, b"MZ"),),
         ".elf": ((0, b"\x7fELF"),),
+        ".so": ((0, b"\x7fELF"),),
+        # --- audio / video with fixed headers ---
         ".wav": ((0, b"RIFF"), (8, b"WAVE")),
         ".avi": ((0, b"RIFF"), (8, b"AVI ")),
-        ".mp4": ((4, b"ftyp"),),
+        ".mkv": ((0, b"\x1a\x45\xdf\xa3"),),
+        ".webm": ((0, b"\x1a\x45\xdf\xa3"),),
+        ".flac": ((0, b"fLaC"),),
+        ".ogg": ((0, b"OggS"),),
+        ".opus": ((0, b"OggS"),),
+        ".mp3": ((0, b"ID3"), (0, b"\xff\xfb"), (0, b"\xff\xf3"), (0, b"\xff\xf2")),
+        # --- archives / encrypted containers ---
+        ".gz": ((0, b"\x1f\x8b"),),
+        ".bz2": ((0, b"BZh"),),
+        ".xz": ((0, b"\xfd7zXZ\x00"),),
+        ".zst": ((0, b"\x28\xb5\x2f\xfd"),),
+        ".7z": ((0, b"7z\xbc\xaf\x27\x1c"),),
+        ".rar": ((0, b"Rar!\x1a\x07\x00"), (0, b"Rar!\x1a\x07\x01\x00")),
+        ".sqlite": ((0, b"SQLite format 3\x00"),),
+        ".sqlite3": ((0, b"SQLite format 3\x00"),),
+        ".db": ((0, b"SQLite format 3\x00"),),
+        ".gpg": ((0, b"\x85\x02"), (0, b"\x8c\x03"), (0, b"\x8d\x04")),
+        ".kdbx": ((0, b"\x03\xd9\xa2\x9a"), (0, b"\x9a\xa2\xd9\x03")),
     }
 
     def validate(self, file_path: FilePath) -> ValidationResult:
         path = _path(file_path)
         extension = path.suffix.lower()
+        format_name = format_name_for(extension)
         signatures = self._SIGNATURES.get(extension)
 
         if not signatures:
             return ValidationResult.unchecked(
                 reason="no magic signature validator available",
                 format_info={"extension": extension or "<none>", "validator": "magic"},
+                format_name=format_name,
             )
 
         max_required = max(offset + len(signature) for offset, signature in signatures)
@@ -194,6 +431,7 @@ class MagicSignatureValidator:
             return ValidationResult.invalid(
                 f"failed to read file header: {exc}",
                 format_info={"extension": extension, "validator": "magic"},
+                format_name=format_name,
             )
 
         for signature_group in signatures:
@@ -204,26 +442,220 @@ class MagicSignatureValidator:
                         "extension": extension,
                         "validator": "magic",
                         "checked": True,
-                    }
+                    },
+                    format_name=format_name,
                 )
 
         return ValidationResult.invalid(
             f"{extension or 'file'} signature mismatch",
             format_info={"extension": extension, "validator": "magic", "checked": True},
             corruption_details=("file header does not match expected magic signature",),
+            format_name=format_name,
+        )
+
+
+class TarValidator:
+    """TAR validation using the per-header checksum field.
+
+    Every 512-byte TAR header carries an octal checksum over its own bytes, so
+    damaged headers are detectable without any extra metadata.
+    """
+
+    BLOCK = 512
+    _MAX_RECORDS = 4096
+
+    @staticmethod
+    def _parse_octal(field: bytes) -> int | None:
+        text = field.split(b"\x00", 1)[0].strip()
+        if not text:
+            return 0
+        try:
+            return int(text, 8)
+        except ValueError:
+            return None
+
+    def validate(self, file_path: FilePath) -> ValidationResult:
+        path = _path(file_path)
+        format_name = "TAR"
+
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return ValidationResult.invalid(
+                f"failed to stat TAR: {exc}", format_info={"validator": "tar"}, format_name=format_name
+            )
+
+        if size < self.BLOCK:
+            return ValidationResult.invalid(
+                "TAR is smaller than one 512-byte block",
+                format_info={"validator": "tar", "checked": True, "size": size},
+                corruption_details=("truncated TAR archive",),
+                format_name=format_name,
+            )
+
+        try:
+            with path.open("rb") as handle:
+                records = 0
+                entries = 0
+                zero_blocks = 0
+
+                while records < self._MAX_RECORDS:
+                    header = handle.read(self.BLOCK)
+                    if len(header) < self.BLOCK:
+                        if header.strip(b"\x00"):
+                            return ValidationResult.invalid(
+                                "TAR ends with a partial header block",
+                                format_info={"validator": "tar", "checked": True, "entries": entries},
+                                corruption_details=("truncated final header block",),
+                                format_name=format_name,
+                            )
+                        break
+
+                    records += 1
+                    if header == bytes(self.BLOCK):
+                        zero_blocks += 1
+                        if zero_blocks >= 2:
+                            break
+                        continue
+
+                    stored = self._parse_octal(header[148:156])
+                    if stored is None:
+                        return ValidationResult.invalid(
+                            "unreadable TAR checksum field",
+                            format_info={"validator": "tar", "checked": True, "entries": entries},
+                            corruption_details=(f"header {records} has a malformed checksum field",),
+                            format_name=format_name,
+                        )
+
+                    # Per POSIX, the checksum is computed with its own field
+                    # replaced by eight ASCII spaces.
+                    checksum_field = header[148:156]
+                    as_spaces = b" " * 8
+                    unsigned = sum(header[:148]) + sum(as_spaces) + sum(header[156:])
+                    signed = (
+                        sum(byte if byte < 128 else byte - 256 for byte in header[:148])
+                        + sum(as_spaces)
+                        + sum(byte if byte < 128 else byte - 256 for byte in header[156:])
+                    )
+                    if stored not in (unsigned, signed):
+                        return ValidationResult.invalid(
+                            "TAR header checksum mismatch",
+                            format_info={"validator": "tar", "checked": True, "entries": entries},
+                            corruption_details=(
+                                f"header {records}: stored checksum {stored}, computed {unsigned}",
+                            ),
+                            format_name=format_name,
+                        )
+
+                    entry_size = self._parse_octal(header[124:136]) or 0
+                    entries += 1
+                    padding = (self.BLOCK - entry_size % self.BLOCK) % self.BLOCK
+                    handle.seek(entry_size + padding, 1)
+
+        except OSError as exc:
+            return ValidationResult.invalid(
+                f"TAR validation error: {exc}",
+                format_info={"validator": "tar", "checked": True},
+                format_name=format_name,
+            )
+
+        return ValidationResult.ok(
+            format_info={"validator": "tar", "checked": True, "entries": entries, "size": size},
+            format_name=format_name,
+        )
+
+
+class SevenZipValidator:
+    """7-Zip validation using the start-header CRC the format defines."""
+
+    _SIGNATURE = b"7z\xbc\xaf\x27\x1c"
+    _START_HEADER_LENGTH = 32
+
+    def validate(self, file_path: FilePath) -> ValidationResult:
+        path = _path(file_path)
+        format_name = "7-Zip"
+
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(self._START_HEADER_LENGTH)
+        except OSError as exc:
+            return ValidationResult.invalid(
+                f"failed to read 7z header: {exc}",
+                format_info={"validator": "7z"},
+                format_name=format_name,
+            )
+
+        if not header.startswith(self._SIGNATURE):
+            return ValidationResult.invalid(
+                "7z signature mismatch",
+                format_info={"validator": "7z", "checked": True},
+                corruption_details=("file does not start with the 7z signature",),
+                format_name=format_name,
+            )
+
+        if len(header) < self._START_HEADER_LENGTH:
+            return ValidationResult.invalid(
+                "truncated 7z start header",
+                format_info={"validator": "7z", "checked": True},
+                corruption_details=("start header is incomplete",),
+                format_name=format_name,
+            )
+
+        stored_crc = int.from_bytes(header[8:12], "little")
+        computed_crc = zlib.crc32(header[12:32]) & 0xFFFFFFFF
+        if stored_crc != computed_crc:
+            return ValidationResult.invalid(
+                "7z start header CRC mismatch",
+                format_info={"validator": "7z", "checked": True},
+                corruption_details=(
+                    f"stored CRC {stored_crc:#010x}, computed {computed_crc:#010x}",
+                ),
+                format_name=format_name,
+            )
+
+        next_header_offset = int.from_bytes(header[12:20], "little")
+        next_header_size = int.from_bytes(header[20:28], "little")
+        next_header_crc = int.from_bytes(header[28:32], "little")
+        invalid_fields = next_header_offset == 0xFFFFFFFFFFFFFFFF or next_header_size == 0xFFFFFFFFFFFFFFFF
+
+        warnings = []
+        if next_header_crc == 0 and next_header_size == 0:
+            warnings.append("archive has no end header")
+
+        return ValidationResult.ok(
+            format_info={
+                "validator": "7z",
+                "checked": True,
+                "has_end_header": not invalid_fields,
+                "warnings": warnings,
+            },
+            format_name=format_name,
         )
 
 
 class ImageValidator:
-    """Image validation with Pillow and magic-signature fallback."""
+    """Image validation with Pillow and structural fallback.
+
+    JPEGs are always checked structurally first (SOI + EOI) because Pillow
+    accepts some truncated files, and because EOI validation must tolerate the
+    trailing bytes that many editors append.
+    """
 
     _MAGIC_FALLBACK = MagicSignatureValidator()
+    _JPEG = JpegValidator()
 
     def validate(self, file_path: FilePath) -> ValidationResult:
         path = _path(file_path)
         extension = path.suffix.lower()
 
+        if extension in {".jpg", ".jpeg"}:
+            structural = self._JPEG.validate(path)
+            if not structural.is_valid:
+                return structural
+
         if not PILLOW_AVAILABLE:
+            if extension in {".jpg", ".jpeg"}:
+                return structural
             return self._MAGIC_FALLBACK.validate(path)
 
         try:
@@ -265,18 +697,21 @@ class ImageValidator:
                         "size": [width, height],
                         "has_transparency": has_transparency,
                         "warnings": warnings,
-                    }
+                    },
+                    format_name=format_name_for(extension),
                 )
 
         except UnidentifiedImageError as exc:
             return ValidationResult.invalid(
                 f"unidentifiable image: {exc}",
                 format_info={"extension": extension, "validator": "pillow", "checked": True},
+                format_name=format_name_for(extension),
             )
         except OSError as exc:
             return ValidationResult.invalid(
                 f"image validation error: {exc}",
                 format_info={"extension": extension, "validator": "pillow", "checked": True},
+                format_name=format_name_for(extension),
             )
 
 
@@ -312,7 +747,7 @@ class PDFValidator:
 
                     format_info = {
                         "extension": extension,
-                        "validator": "pypdf2",
+                        "validator": PDF_LIBRARY_NAME or "pypdf",
                         "checked": True,
                         "page_count": page_count,
                         "is_encrypted": is_encrypted,
@@ -338,7 +773,7 @@ class PDFValidator:
                 issues.append(str(exc))
                 return ValidationResult.invalid(
                     "PDF validation error",
-                    format_info={"extension": extension, "validator": "pypdf2", "checked": True},
+                    format_info={"extension": extension, "validator": PDF_LIBRARY_NAME or "pypdf", "checked": True},
                     corruption_details=issues,
                 )
 
@@ -413,6 +848,20 @@ class ArchiveValidator:
             )
 
 
+def _zip_member_root_tag(path: Path, member: str) -> str | None:
+    """Root XML tag of a zip member, or None if it cannot be parsed."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            with archive.open(member) as handle:
+                for _event, element in ET.iterparse(handle, events=("start",)):
+                    return element.tag
+    except Exception:
+        return None
+    return None
+
+
 class DocumentValidator:
     """DOCX and XLSX validation with structural and library-aware checks."""
 
@@ -438,6 +887,15 @@ class DocumentValidator:
             issues.append("missing [Content_Types].xml")
         if "word/document.xml" not in names:
             issues.append("missing word/document.xml")
+        else:
+            # A package can carry a file of that name without it being a
+            # WordprocessingML document (the audit corpus had a zip with a
+            # random payload named word/document.xml that sailed through).
+            root_tag = _zip_member_root_tag(path, "word/document.xml")
+            if root_tag is None:
+                issues.append("word/document.xml is not readable XML")
+            elif not root_tag.endswith("}document"):
+                issues.append(f"word/document.xml root is {root_tag}, not w:document")
 
         if issues:
             return ValidationResult.invalid(
@@ -464,9 +922,13 @@ class DocumentValidator:
                     "has_core_properties": document.core_properties is not None,
                 }
             except Exception as exc:
+                # python-docx raises assorted internal errors (e.g. an lxml
+                # AttributeError) on malformed packages; report what they mean
+                # rather than leaking the library's exception text.
                 return ValidationResult.invalid(
-                    f"DOCX validation error: {exc}",
+                    "python-docx cannot read this DOCX package",
                     format_info={"extension": ".docx", "validator": "python-docx", "checked": True},
+                    corruption_details=[f"{type(exc).__name__}: {exc}"],
                 )
 
         return ValidationResult.ok(format_info=format_info)
@@ -491,6 +953,12 @@ class DocumentValidator:
             issues.append("missing [Content_Types].xml")
         if "xl/workbook.xml" not in names:
             issues.append("missing xl/workbook.xml")
+        else:
+            root_tag = _zip_member_root_tag(path, "xl/workbook.xml")
+            if root_tag is None:
+                issues.append("xl/workbook.xml is not readable XML")
+            elif not root_tag.endswith("}workbook"):
+                issues.append(f"xl/workbook.xml root is {root_tag}, not workbook")
 
         if issues:
             return ValidationResult.invalid(
@@ -518,8 +986,9 @@ class DocumentValidator:
                 }
             except Exception as exc:
                 return ValidationResult.invalid(
-                    f"XLSX validation error: {exc}",
+                    "openpyxl cannot read this XLSX package",
                     format_info={"extension": ".xlsx", "validator": "openpyxl", "checked": True},
+                    corruption_details=[f"{type(exc).__name__}: {exc}"],
                 )
             finally:
                 if workbook is not None:
@@ -536,8 +1005,14 @@ class MediaValidator:
         extension = path.suffix.lower()
 
         if not FFPROBE_AVAILABLE:
+            # Without ffprobe the container signature is still checkable, so a
+            # garbage file is not silently reported as "unknown but fine".
+            fallback = MagicSignatureValidator().validate(path)
+            if fallback.checked:
+                fallback.format_info["validator"] = "magic (ffprobe unavailable)"
+                return fallback
             return ValidationResult.unchecked(
-                reason="ffprobe not available",
+                reason="ffprobe not available and no container signature for this type",
                 format_info={"extension": extension, "validator": "ffprobe"},
             )
 
@@ -635,10 +1110,16 @@ class FormatValidatorFactory:
     _document_validator = DocumentValidator()
     _media_validator = MediaValidator()
     _magic_validator = MagicSignatureValidator()
+    _isobmff_validator = IsoBmffValidator()
+    _tar_validator = TarValidator()
+    _sevenzip_validator = SevenZipValidator()
 
     _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".ico"})
     _PDF_EXTENSIONS = frozenset({".pdf"})
     _ARCHIVE_EXTENSIONS = frozenset({".zip", ".jar", ".apk"})
+    _TAR_EXTENSIONS = frozenset({".tar"})
+    _SEVENZIP_EXTENSIONS = frozenset({".7z"})
+    _ISOBMFF_EXTENSIONS = frozenset({".mp4", ".m4a", ".m4v", ".mov", ".3gp", ".heic", ".heif", ".avif"})
     _MEDIA_EXTENSIONS = frozenset({".mp4", ".avi", ".mov", ".mkv", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".webm"})
     _DOCX_EXTENSIONS = frozenset({".docx"})
     _XLSX_EXTENSIONS = frozenset({".xlsx"})
@@ -653,6 +1134,12 @@ class FormatValidatorFactory:
             return cls._pdf_validator
         if extension in cls._ARCHIVE_EXTENSIONS:
             return cls._archive_validator
+        if extension in cls._ISOBMFF_EXTENSIONS:
+            return cls._isobmff_validator
+        if extension in cls._TAR_EXTENSIONS:
+            return cls._tar_validator
+        if extension in cls._SEVENZIP_EXTENSIONS:
+            return cls._sevenzip_validator
         if extension in cls._MEDIA_EXTENSIONS:
             return cls._media_validator
         if extension in cls._DOCX_EXTENSIONS:
@@ -669,26 +1156,38 @@ class FormatValidatorFactory:
         path = _path(file_path)
         extension = path.suffix.lower()
 
+        def labelled(result: ValidationResult) -> ValidationResult:
+            """Guarantee every result carries a display name for reporting."""
+            if result.format_name is not None:
+                return result
+            return replace(result, format_name=format_name_for(extension))
+
         try:
             if extension in cls._DOCX_EXTENSIONS:
-                return cls._document_validator.validate_docx(path)
+                return labelled(cls._document_validator.validate_docx(path))
             if extension in cls._XLSX_EXTENSIONS:
-                return cls._document_validator.validate_xlsx(path)
+                return labelled(cls._document_validator.validate_xlsx(path))
 
             validator = cls.get_validator(path)
             if validator is None:
-                return ValidationResult.unchecked(
-                    reason="no specific validator available",
-                    format_info={"extension": extension or "<none>", "validator": "none"},
+                return labelled(
+                    ValidationResult.unchecked(
+                        reason="no specific validator available",
+                        format_info={"extension": extension or "<none>", "validator": "none"},
+                    )
                 )
 
-            return validator.validate(path)
+            return labelled(validator.validate(path))
 
         except Exception as exc:
-            LOGGER.exception("validation error for %s", path)
-            return ValidationResult.invalid(
-                f"validation error: {exc}",
-                format_info={"extension": extension or "<none>", "validator": "factory", "checked": True},
+            # A file that fails its own format checks is an expected outcome,
+            # not a programming error: log it concisely.
+            LOGGER.warning("validation failed for %s: %s: %s", path, type(exc).__name__, exc)
+            return labelled(
+                ValidationResult.invalid(
+                    f"validation error: {exc}",
+                    format_info={"extension": extension or "<none>", "validator": "factory", "checked": True},
+                )
             )
 
     @classmethod
@@ -747,7 +1246,7 @@ def get_library_status() -> dict[str, bool]:
     return {
         "Built-in Magic Validator": True,
         "Pillow (Images)": PILLOW_AVAILABLE,
-        "PyPDF2 (PDFs)": PYPDF2_AVAILABLE,
+        (f"{PDF_LIBRARY_NAME} (PDFs)" if PYPDF2_AVAILABLE else "pypdf (PDFs)"): PYPDF2_AVAILABLE,
         "ffprobe (Media)": FFPROBE_AVAILABLE,
         "python-docx (Word)": DOCX_AVAILABLE,
         "openpyxl (Excel)": OPENPYXL_AVAILABLE,
@@ -811,7 +1310,7 @@ class TestFormatValidators(unittest.TestCase):
         status = get_library_status()
         self.assertIn("Built-in Magic Validator", status)
         self.assertIn("Pillow (Images)", status)
-        self.assertIn("PyPDF2 (PDFs)", status)
+        self.assertTrue(any("PDF" in key for key in status), status)
 
 
 if __name__ == "__main__":

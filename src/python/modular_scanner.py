@@ -59,15 +59,42 @@ def _load_processor_factory() -> Any:
 
     _configure_import_path()
 
-    try:
-        from processing_modules import ProcessorFactory  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "failed to import ProcessorFactory from processing_modules"
-        ) from exc
+    processor_factory = None
 
-    _PROCESSOR_FACTORY = ProcessorFactory
+    # Try every plausible way of locating the sibling module: direct import,
+    # package import, then loading it by file path. v2.0 depended on a single
+    # spelling and broke whenever the launcher changed.
+    for loader in (
+        lambda: __import__("core_analyzer").load_sibling_module("processing_modules").ProcessorFactory,
+        lambda: __import__("processing_modules").ProcessorFactory,
+        lambda: __import__("src.python.processing_modules", fromlist=["x"]).ProcessorFactory,
+        _load_by_path,
+    ):
+        try:
+            processor_factory = loader()
+            break
+        except Exception:
+            continue
+
+    if processor_factory is None:
+        raise RuntimeError("failed to import ProcessorFactory from processing_modules")
+
+    _PROCESSOR_FACTORY = processor_factory
     return _PROCESSOR_FACTORY
+
+
+def _load_by_path() -> Any:
+    """Load processing_modules.py from this file's directory."""
+    import importlib.util
+
+    candidate = Path(__file__).resolve().parent / "processing_modules.py"
+    spec = importlib.util.spec_from_file_location("cie_processing_modules", candidate)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {candidate}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.ProcessorFactory
 
 
 # ==============================================================================

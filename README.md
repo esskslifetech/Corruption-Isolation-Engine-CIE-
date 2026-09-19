@@ -4,6 +4,15 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 
 **Version 2.0** | **This Project Is Made By Kanishk Soni**
 
+> **Status note (audit revision).** The v2.0 tree shipped with a stdlib-shadowing
+> module name that broke every `cie.py` command, unit tests that called functions
+> which did not exist, and a requirements file that `pip` refused to install.
+> Those defects are fixed in this revision; `python3 -m pytest tests/` (158
+> tests) and the CLI matrix in `docs/USER_GUIDE.md` pass. Measured detection
+> limits and the remaining known gaps are listed under
+> [Verification status](#verification-status) - please read that section before
+> relying on a "healthy" verdict.
+
 ## Features
 
 - **Fast Corruption Detection**: Advanced algorithms to quickly identify corrupted files
@@ -11,7 +20,7 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **Modular Processing System**: Deterministic file collection and reporting
 - **Format-Specific Validation**: Deep analysis using specialized libraries:
   - **Images**: Pillow for JPEG, PNG, GIF, BMP, TIFF, WebP validation
-  - **PDFs**: PyPDF2/PyPDF4 for PDF structure and content validation
+  - **PDFs**: pypdf (pypdf-compatible API) for PDF structure and content validation
   - **Archives**: ZIP file integrity testing
   - **Media**: FFmpeg for video/audio file validation
   - **Documents**: python-docx for Word, openpyxl for Excel files
@@ -23,7 +32,9 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **SQLite Database**: Persistent storage of file metadata and analysis history with WAL mode
 - **Cross-Platform Support**: Works on Linux, macOS, and Windows
 - **Concurrent Processing**: Multi-threaded scanning with configurable worker threads
-- **Self-Testing**: Built-in test suite for validation
+- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 158 pytest tests
+- **Quarantine with restore**: quarantined files are logged and can be restored, never
+  silently deleted, and the engine's own database is never scanned or quarantined
 
 ## Architecture
 
@@ -32,7 +43,7 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **Format Validators** (`src/python/format_validators.py`): Specialized file format validation
 - **Modular Scanner** (`src/python/modular_scanner.py`): Advanced scanning with multiple strategies
 - **Processing Modules** (`src/python/processing_modules.py`): File processing pipeline
-- **Math Utilities** (`src/python/math.py`): Mathematical utilities for entropy and analysis
+- **Math Utilities** (`src/python/cie_math.py`): Mathematical utilities for entropy and analysis
 - **GUI Interface** (`src/gui/main_window.py`): User-friendly tkinter interface
 
 ### C++ Components
@@ -51,12 +62,14 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 1. Clone or download the project
 2. Install Python dependencies:
    ```bash
-   # Using the installation script (recommended)
+   # Using the installation script (recommended; verifies the install)
    ./install_dependencies.sh
-   
+
    # Or manually with pip
-   pip3 install -r requirements.txt
+   python3 -m pip install -r requirements.txt
    ```
+   The engine itself runs with **no** third-party packages; Pillow/pypdf/
+   python-docx/openpyxl/numpy only deepen the checks.
 
 3. Install FFmpeg for media file validation (optional but recommended):
    ```bash
@@ -150,36 +163,83 @@ python3 cie.py --scan /path/to/directory --verbose
 
 # Fail on corruption detection (useful for CI/CD)
 python3 cie.py --scan /path/to/directory --fail-on-findings
+
+# List and restore quarantined files
+python3 cie.py --list-quarantine
+python3 cie.py --restore quarantine/<name>
+
+# Use a configuration file (CLI flags always win)
+python3 cie.py --scan /path/to/directory --config config/cie_config.json
 ```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0    | Scan completed, nothing corrupted |
+| 1    | Usage error (bad arguments, missing directory, unreadable config) |
+| 2    | Scan completed and corruption / ransomware-like findings were found (`--fail-on-findings`) |
+| 3    | Scan incomplete: at least one file could not be analysed |
 
 ## File Corruption Detection Methods
 
 The CIE uses multiple methods to detect file corruption:
 
-1. **Checksum Verification**: SHA-256 checksums to detect changes
-2. **Binary Pattern Analysis**: Detects null byte patterns and repeated patterns
-3. **File Structure Validation**: Validates file headers for common formats (JPEG, PNG, PDF, ZIP)
-4. **Size Anomaly Detection**: Identifies suspicious file sizes (empty files)
-5. **Historical Comparison**: Compares with stored metadata from previous scans
-6. **Entropy Analysis**: Detects high-entropy files characteristic of ransomware encryption
-7. **Format-Specific Validation**: Deep validation using specialized libraries
-8. **Concurrent Processing**: Parallel analysis for improved performance
+1. **Format-Specific Validation**: magic bytes plus real decoders - Pillow
+   (images), pypdf (PDF), zip CRCs, tar header checksums, 7z/gzip CRCs,
+   python-docx / openpyxl (OOXML parts), ffprobe (media when installed)
+2. **Binary Pattern Analysis**: null-byte and control-character ratios,
+   binary junk in text files
+3. **Size Anomaly Detection**: zero-byte files (reported as a warning, never
+   auto-quarantined)
+4. **Historical Comparison**: size/checksum against the recorded baseline, so
+   in-place damage that keeps the file size is still found on the next scan
+5. **Entropy Analysis**: high entropy is only *suspicious*; it is treated as
+   ransomware-like when a file's entropy jumps by >= 2 bits/byte versus its own
+   recorded baseline or when the name matches a known ransomware extension
+6. **Concurrent Processing**: parallel analysis for improved performance
+
+Corruption, warnings (empty / high entropy) and faults (unreadable files) are
+separate categories: only corruption is eligible for quarantine, and a fault
+makes the scan "incomplete" rather than "clean".
+
+### What a single scan can and cannot see
+
+Measured on the audit corpus (18 damaged files + 12 healthy files):
+
+- **Formats that carry integrity metadata** (PNG, WebP, ZIP/DOCX/XLSX, PDF, gzip,
+  tar, 7z): damage is caught immediately, 9/9 in testing.
+- **Formats without any checksum** (JPEG, BMP, TIFF, MP4, RAR, EXE, ELF, TXT):
+  a one-shot scan sees only header/structure damage. Damage hidden inside the
+  payload is found on the *second* scan, by comparison with the stored baseline
+  (12/12 in testing). If you need first-scan certainty for such files, scan the
+  intact set once to establish baselines before the damage occurs.
+- **Pure random noise** (.bin/.txt) is deliberately *not* called corrupted; it
+  is reported as high entropy / unknown, not as damage.
 
 ## Supported File Types
 
-- **Images**: JPEG, PNG, GIF, BMP, TIFF
-- **Documents**: PDF, DOCX, XLSX, TXT
-- **Archives**: ZIP, RAR, 7Z, TAR
+- **Images**: JPEG, PNG, GIF, BMP, TIFF, WebP (Pillow; CRC-checked for PNG/WebP)
+- **Documents**: PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, XML, Markdown
+- **Archives**: ZIP, JAR/APK (CRCs), TAR (checksums), 7Z (start-header CRC), GZ
+- **Media**: MP4/MKV/MP3 and friends (needs `ffprobe` for content checks;
+  container signatures are checked without it)
 - **Databases**: SQLite, MySQL files (basic structure checks)
 - **Binary Files**: Executables and other binary formats
-- **Custom Files**: Any file type can be analyzed
+- **Custom Files**: Any file type can be analyzed (unchecked formats are labelled
+  `not inspected`, never silently assumed to be fine)
 
 ## Quarantine System
 
-Corrupted files are automatically moved to a `quarantine/` directory with:
+Corrupted files can be moved to a `quarantine/` directory with:
 - Timestamp-based naming to prevent conflicts
-- Detailed logging in SQLite database
-- Original path preservation for recovery
+- A `quarantine_log` row recording the original path and reason
+- Restore support: `python3 cie.py --restore <quarantined file>` or the GUI's
+  Quarantine Viewer. A restore never overwrites a file that now exists at the
+  original path; it writes `<name>_restored_<timestamp>` alongside it instead.
+- Safety rails: the engine's own database (`*.db`, `-wal`, `-shm`) and the
+  quarantine directory are never flagged and never quarantined, so a scan can no
+  longer disable the engine it is part of.
 
 ## Project Structure
 
@@ -191,29 +251,37 @@ Corruption_isolation_engine/
 │   │   ├── format_validators.py      # File format validation
 │   │   ├── modular_scanner.py        # Advanced scanning strategies
 │   │   ├── processing_modules.py     # File processing pipeline
-│   │   └── math.py                   # Mathematical utilities
+│   │   └── cie_math.py               # Mathematical utilities
 │   ├── cpp/
-│   │   └── file_analyzer.cpp         # High-performance analysis
+│   │   └── file_analyzer.cpp         # Optional high-performance analysis
 │   └── gui/
 │       └── main_window.py            # Tkinter GUI
 ├── config/
 │   └── cie_config.json               # Configuration file
-├── tests/                            # Test files
+├── tests/                            # pytest suite (flat: no unit/integration split)
 ├── docs/                             # Documentation
-├── .qodo/                            # Agent workflows
-├── quarantine/                       # Quarantined files
+├── quarantine/                       # Quarantined files (created at runtime)
 ├── cie.py                            # Main entry point
+├── pytest.ini                        # Test configuration
 ├── requirements.txt                  # Python dependencies
 ├── install_dependencies.sh           # Installation script
 ├── Makefile                          # Build automation
-├── cie_database.db                   # SQLite database (created)
+├── LICENSE                           # MIT
 └── README.md                         # This file
+```
+
+`cie_database.db` is **not** part of the repository: it is created on first run
+and is deliberately excluded (see `.gitignore`). The v2.0 tarball shipped one
+with 81,782 rows of another machine's paths.
 ```
 
 ## Build Commands
 
+`make all` checks the engine (it does **not** launch the GUI); use `make gui`
+for that.
+
 ```bash
-# Build everything
+# Check everything is ready to run
 make all
 
 # Build only C++ module
@@ -237,16 +305,20 @@ make clean-quarantine
 # Full clean (including databases)
 make clean-all
 
-# Run tests
+# Run tests (pytest, 158 tests)
 make test
 
-# Test C++ compilation
+# Run the self-tests embedded in each module (no pytest needed)
+make test-selftest
+
+# Build the optional C++ helper
 make test-cpp
 
-# Test Python module
-make test-python
+# Quick scan helpers
+make scan DIR=/path/to/data
+make scan-fast DIR=/path/to/data
 
-# Create distribution package
+# Create distribution package (excludes .db / quarantine / caches)
 make dist
 
 # Show all available commands
@@ -263,13 +335,25 @@ The application can be configured through:
 - File type detection rules
 - Quarantine directory location
 
-### Key Configuration Options
-- **Database**: SQLite path, backup settings
-- **Scanning**: Chunk size, max file size, hidden file handling
-- **Quarantine**: Directory, auto-cleanup, size limits
-- **Detection**: Checksum algorithm, binary analysis, thresholds
-- **GUI**: Theme, window dimensions, refresh settings
-- **Logging**: Level, file rotation, backup count
+### Key Configuration Options (actually honoured)
+
+| JSON key | Effect |
+|----------|--------|
+| `database.path` | SQLite database location |
+| `quarantine.directory` | where quarantined files are moved |
+| `scanning.chunk_size` | read/streaming chunk size in bytes |
+| `scanning.skip_hidden_files` | inverse of `include_hidden_files` |
+| `scanning.follow_symlinks` | follow symlinks during collection |
+| `scanning.max_workers` | worker threads |
+| `detection.checksum_algorithm` | `sha256` / `sha512` / `md5` / `blake2b` |
+| `detection.structure_validation_enabled` | enable library-backed validators |
+| `detection.ransomware_detection_enabled` | enable the entropy/extension heuristics |
+| `detection.entropy_threshold`, `detection.entropy_jump_threshold` | detection thresholds |
+
+Precedence: **CLI flag > config file > built-in default**. Unknown keys are
+ignored with a warning, so a hand-edited file cannot break a scan. The GUI
+theme/logging keys in `config/cie_config.json` are advisory only - the engine
+has no theme or log-rotation settings.
 
 ## Database Schema
 
@@ -280,20 +364,29 @@ The application uses SQLite with two main tables:
 
 ## Performance
 
-- **C++ Module**: Optimized for fast binary analysis of large directories
-- **Python Module**: Feature-rich with database integration and concurrent processing
-- **Modular Scanner**: Multiple strategies (fast, balanced, deep) for different use cases
-- **Parallel Processing**: Configurable multi-threaded scanning (default: CPU count × 2)
-- **Memory Efficient**: Streaming analysis for large files with configurable chunk sizes
-- **Database Optimization**: WAL mode, connection pooling, retry mechanisms
-- **Entropy Calculation**: Single-pass Shannon entropy computation
+Measured by the audit (20.04 MB/s for the Python engine on a 10,000-file
+corpus; the C++ helper reached 107.3 MB/s but is not wired into the engine):
+
+- **Modular Scanner**: fast / balanced / deep strategies, same verdicts on the
+  same files; "fast" reduces *file collection* work, not validation depth
+- **Parallel Processing**: configurable worker threads (default: CPU count × 2).
+  On I/O-bound local scans throughput did **not** improve with more threads
+  (20.88 / 20.13 / 19.86 MB/s at 1 / 4 / 8 workers)
+- **Memory Efficient**: streaming analysis with configurable chunk sizes
+- **Database Optimization**: WAL mode, retries with backoff, schema migration
+- **Entropy Calculation**: single-pass Shannon entropy (numpy-accelerated when
+  numpy is installed, identical results without it)
 
 ## Security
 
-- No network access required
-- All processing done locally
-- Quarantine prevents accidental execution of corrupted files
-- Detailed logging for audit trails
+- No network access required; all processing is local
+- Quarantine prevents accidental execution of corrupted files, and the
+  quarantine directory is excluded from subsequent scans so a scan can never
+  re-quarantine its own quarantine
+- The engine's own database files are never scanned or moved (this used to
+  disable the tool itself)
+- Detailed logging for audit trails; expected corruption is logged at warning
+  level so a genuine traceback still stands out
 
 ## Contributing
 
@@ -303,9 +396,38 @@ The application uses SQLite with two main tables:
 4. Add tests if applicable
 5. Submit a pull request
 
+## Verification status
+
+All numbers below were measured by the audit harness (`/home/user/audit/`) on
+Linux, Python 3.11, Pillow installed, ffmpeg absent:
+
+| Check | Result |
+|-------|--------|
+| pytest suite | 158 passed |
+| CLI commands (`--version`, `--library-status`, `--self-test`, `--scan`, `--modular-scan`, `--fast-scan`, `--list-quarantine`, `--restore`) | all exit 0 |
+| Recall, formats with integrity metadata | 9/9 |
+| Recall, same-size damage found on a *second* scan (baseline) | 12/12 |
+| Recall, formats without checksums, first scan | 0/9 (documented) |
+| False positives on 12 real-world healthy files (GPG, KDBX, disk image, OPUS, MKV, JAR, padded JPEG, MP4 with leading `free` box, ...) | 0 |
+| Self-quarantine (engine's own DB / WAL / quarantine dir) | refused |
+| Restore round-trip | pass |
+
+Known limitations, stated rather than hidden:
+
+- A file whose payload changed without changing the size or the format structure
+  is only detectable against a baseline (see above).
+- Text in non-UTF-8 legacy encodings (e.g. `Big5`, `KOI8-R`, `Latin-1` bytes)
+  can still be reported as undecodable text - it is reported as a warning, not
+  quarantined automatically.
+- The C++ helper (`src/cpp/file_analyzer.cpp`) is not called by the Python
+  engine; it remains a standalone experimental tool.
+- Multi-threaded scanning does not measurably speed up I/O-bound scans.
+
 ## License
 
-This project is open source. Please check the LICENSE file for details.
+MIT - see [LICENSE](LICENSE). (The upstream repository referenced a LICENSE file
+that did not exist; MIT was added during the audit. Replace it if a different
+license is intended.)
 
 ## Troubleshooting
 
@@ -315,7 +437,7 @@ This project is open source. Please check the LICENSE file for details.
    - Ubuntu: `sudo apt-get install python3-tk`
    - Fedora: `sudo dnf install python3-tkinter`
 
-2. **C++ compilation errors**: Ensure g++ supports C++17
+2. **C++ compilation errors**: Ensure g++ supports C++20
    - Update compiler: `sudo apt-get install g++`
 
 3. **Permission errors**: Ensure read access to target directories
@@ -335,6 +457,11 @@ For issues and questions:
 3. Create an issue with detailed information
 
 ## Version History
+
+- **v2.0 (audit revision)**: repairs for the defects found by the independent
+  audit - import shadowing, phantom tests, destructive self-quarantine,
+  false positives on valid text/encodings, installable requirements, working
+  Makefile targets, restore support, and honest detection limits.
 
 - **v2.0**: Major update with enhanced features
   - Modular scanning system with multiple strategies

@@ -183,7 +183,7 @@ result = validator.validate("/path/to/image.jpg")
 
 #### PDFValidator
 
-Validates PDF files using PyPDF2/PyPDF4.
+Validates PDF files using pypdf (pypdf-compatible API).
 
 ```python
 from src.python.format_validators import PDFValidator

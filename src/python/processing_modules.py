@@ -48,6 +48,36 @@ _TEXT_EXTENSIONS = {
 }
 
 
+def _load_module(name: str) -> Any:
+    """Import a sibling module regardless of how this file was imported."""
+    import importlib
+    import importlib.util
+
+    for attempt in (
+        lambda: importlib.import_module(name),
+        lambda: importlib.import_module(f"src.python.{name}"),
+        lambda: _load_module_by_path(name),
+    ):
+        try:
+            return attempt()
+        except Exception:
+            continue
+    raise ImportError(f"cannot import {name}")
+
+
+def _load_module_by_path(name: str) -> Any:
+    import importlib.util
+
+    candidate = Path(__file__).resolve().parent / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"cie_{name}", candidate)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {candidate}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _read_prefix(path: Path, size: int) -> bytes:
     with path.open("rb") as handle:
         return handle.read(size)
@@ -191,8 +221,8 @@ class BasicFileProcessor:
         error_message: str | None = None
 
         if file_size == 0:
-            is_corrupted = True
-            error_message = "empty file"
+            # Warning, not corruption - empty placeholders are legitimate.
+            details.append("empty file")
 
         if sampled_hash:
             details.append("checksum is sampled, not full-file")
@@ -255,14 +285,15 @@ class NullBytePatternProcessor:
             )
 
         if not sample:
+            # Empty is a warning, never corruption.
             return FastResult(
                 file_path=str(path),
                 file_size=file_size,
                 file_type=path.suffix.lower(),
                 checksum="",
-                is_corrupted=True,
+                is_corrupted=False,
                 processing_time_seconds=time.perf_counter() - started,
-                error_message="empty file",
+                details=("empty file",),
             )
 
         null_ratio = sample.count(0) / len(sample)
@@ -356,8 +387,72 @@ class ImageHeaderProcessor:
         )
 
 
+def _looks_like_text(decoded: str, threshold: float = 0.95) -> bool:
+    """True when nearly every character is printable (BOM/whitespace allowed)."""
+    if not decoded:
+        return False
+    acceptable = sum(
+        1 for char in decoded
+        if char.isprintable() or char.isspace() or char == "\ufeff"
+    )
+    return acceptable / len(decoded) >= threshold
+
+
+def decode_as_text(sample: bytes) -> str | None:
+    """Return the encoding name if the sample decodes as text, else None.
+
+    Replaces the old "non-ASCII byte ratio >= 70% means corrupt" heuristic,
+    which flagged every CJK, Devanagari, Cyrillic, Arabic or emoji document as
+    binary. UTF-16/32 are tried too, because files saved by Windows tools and
+    exported CSVs are full of NUL bytes without being damaged.
+    """
+    if not sample:
+        return None
+
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            sample.decode(encoding)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+
+    # BOM-less UTF-16/32. Random bytes can *decode* as UTF-16 by accident, so
+    # require the structural fingerprint of real UTF-16 text: NUL bytes sitting
+    # consistently in one byte position (the high byte of Latin/ASCII-range
+    # code points), plus an all-printable result.
+    for encoding, nul_positions in (("utf-16-le", {1}), ("utf-16-be", {0})):
+        try:
+            decoded = sample.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+        nul_indices = [index for index, byte in enumerate(sample) if byte == 0]
+        if not nul_indices:
+            continue
+        aligned = sum(1 for index in nul_indices if (index % 2) in nul_positions)
+        if aligned / len(nul_indices) < 0.95:
+            continue
+
+        if decoded and _looks_like_text(decoded):
+            return encoding
+
+    for encoding in ("utf-32-le", "utf-32-be"):
+        try:
+            decoded = sample.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        if decoded and _looks_like_text(decoded):
+            return encoding
+
+    return None
+
+
 class TextEncodingProcessor:
-    """Flags text-like files that look binary."""
+    """Flags text-like files whose bytes are not decodable as text.
+
+    Corruption is reported only when the content cannot be decoded as
+    UTF-8/16/32 *and* shows binary markers (NUL runs or control characters).
+    """
 
     def __init__(self, max_sample_size: int = 8192):
         self.max_sample_size = max(1, max_sample_size)
@@ -396,22 +491,42 @@ class TextEncodingProcessor:
             )
 
         if not sample:
+            # An empty file is a warning, not corruption: .gitkeep, touch'd
+            # placeholders, rotated logs and lock files are legitimately empty.
             return FastResult(
                 file_path=str(path),
                 file_size=file_size,
                 file_type=extension,
                 checksum="",
-                is_corrupted=True,
+                is_corrupted=False,
                 processing_time_seconds=time.perf_counter() - started,
-                error_message="empty text file",
+                error_message=None,
+                details=("empty file",),
             )
 
-        null_ratio = sample.count(0) / len(sample)
-        non_ascii_ratio = sum(1 for byte in sample if byte >= 128) / len(sample)
+        encoding = decode_as_text(sample)
+        if encoding is not None:
+            return FastResult(
+                file_path=str(path),
+                file_size=file_size,
+                file_type=extension,
+                checksum="",
+                is_corrupted=False,
+                processing_time_seconds=time.perf_counter() - started,
+                details=(f"decoded as {encoding}",),
+            )
 
-        is_corrupted = null_ratio >= 0.30 or non_ascii_ratio >= 0.70
+        # Undecodable: only call it corruption when binary markers are present,
+        # otherwise it is simply an unknown encoding.
+        null_ratio = sample.count(0) / len(sample)
+        control_ratio = sum(
+            1 for byte in sample if byte < 9 or (13 < byte < 32)
+        ) / len(sample)
+
+        is_corrupted = null_ratio >= 0.30 or control_ratio >= 0.10
         error_message = (
-            f"binary-like content in text file (null {null_ratio:.1%}, non-ASCII {non_ascii_ratio:.1%})"
+            f"undecodable text with binary markers "
+            f"(null {null_ratio:.1%}, control {control_ratio:.1%})"
             if is_corrupted
             else None
         )
@@ -424,6 +539,90 @@ class TextEncodingProcessor:
             is_corrupted=is_corrupted,
             processing_time_seconds=time.perf_counter() - started,
             error_message=error_message,
+            details=() if is_corrupted else ("unknown text encoding",),
+        )
+
+
+class StructureValidatorProcessor:
+    """Validates file structure using the shared validators in format_validators.
+
+    Without this, the modular scanner had no idea what a corrupt PDF or a fake
+    PNG looked like (it only checked a handful of image headers), so its
+    verdicts disagreed with the core engine on the same files.
+
+    ``full=False`` performs signature-only checks (fast strategy);
+    ``full=True`` additionally uses Pillow/PyPDF2/openpyxl/ffprobe when present.
+    """
+
+    def __init__(self, full: bool = True, allow_unchecked: bool = True):
+        self.full = full
+        self.allow_unchecked = allow_unchecked
+        self._validator: Any | None = None
+
+    def _load(self) -> Any | None:
+        if self._validator is not None:
+            return self._validator
+        try:
+            module = _load_module("format_validators")
+        except Exception as exc:  # pragma: no cover - layout dependent
+            LOGGER.warning("structure validation unavailable: %s", exc)
+            return None
+
+        self._factory = module.FactoryBackedFormatValidator()
+        self._magic = module.MagicSignatureValidator()
+        self._validator = self._factory if self.full else self._magic
+        return self._validator
+
+    def can_process(self, path: Path) -> bool:
+        return path.is_file()
+
+    def process(self, path: Path) -> FastResult:
+        started = time.perf_counter()
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return FastResult(
+                file_path=str(path), file_size=0, file_type=path.suffix.lower(),
+                checksum="", is_corrupted=True,
+                processing_time_seconds=time.perf_counter() - started,
+                error_message=f"stat failed: {exc}",
+            )
+
+        validator = self._load()
+        if validator is None:
+            return FastResult(
+                file_path=str(path), file_size=size, file_type=path.suffix.lower(),
+                checksum="", is_corrupted=False,
+                processing_time_seconds=time.perf_counter() - started,
+                details=("structure validation unavailable",),
+            )
+
+        try:
+            result = validator.validate(path)
+        except Exception as exc:
+            LOGGER.warning("structure validation failed for %s: %s", path, exc)
+            return FastResult(
+                file_path=str(path), file_size=size, file_type=path.suffix.lower(),
+                checksum="", is_corrupted=False,
+                processing_time_seconds=time.perf_counter() - started,
+                details=(f"structure validation skipped: {exc}",),
+            )
+
+        details: list[str] = []
+        if not result.checked:
+            details.append(result.format_info.get("reason", "not inspected"))
+        if result.is_valid and self.allow_unchecked:
+            details.append(f"validated by {result.format_info.get('validator', 'validator')}")
+
+        return FastResult(
+            file_path=str(path),
+            file_size=size,
+            file_type=result.format_name or path.suffix.lower(),
+            checksum="",
+            is_corrupted=not result.is_valid,
+            processing_time_seconds=time.perf_counter() - started,
+            error_message=None if result.is_valid else (result.error_message or "invalid structure"),
+            details=tuple(details),
         )
 
 
@@ -439,6 +638,7 @@ class FastScanStrategy:
         return (
             BasicFileProcessor(hash_algorithm="md5", chunk_size=64 * 1024),
             NullBytePatternProcessor(null_ratio_threshold=0.85, repeating_block_size=16),
+            StructureValidatorProcessor(full=True),
         )
 
     def max_workers(self) -> int:
@@ -456,6 +656,7 @@ class BalancedScanStrategy:
             ImageHeaderProcessor(),
             TextEncodingProcessor(max_sample_size=8 * 1024),
             NullBytePatternProcessor(null_ratio_threshold=0.80, repeating_block_size=16),
+            StructureValidatorProcessor(full=True),
         )
 
     def max_workers(self) -> int:
@@ -473,6 +674,7 @@ class DeepScanStrategy:
             ImageHeaderProcessor(),
             TextEncodingProcessor(max_sample_size=32 * 1024),
             NullBytePatternProcessor(null_ratio_threshold=0.75, repeating_block_size=32, max_sample_size=32 * 1024),
+            StructureValidatorProcessor(full=True),
         )
 
     def max_workers(self) -> int:
@@ -557,7 +759,7 @@ class ModularProcessor:
                 if processor.can_process(path):
                     results.append(processor.process(path))
             except Exception as exc:
-                LOGGER.exception("validator failure for %s using %s", path, type(processor).__name__)
+                LOGGER.warning("validator failure for %s using %s: %s", path, type(processor).__name__, exc)
                 results.append(
                     FastResult(
                         file_path=str(path),
@@ -727,7 +929,7 @@ class TestModularProcessor(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].is_corrupted)
-        self.assertIn("text file", results[0].error_message or "")
+        self.assertIn("undecodable text", results[0].error_message or "")
 
     def test_result_order_is_deterministic(self) -> None:
         a = self._write("b.txt", b"bbb")

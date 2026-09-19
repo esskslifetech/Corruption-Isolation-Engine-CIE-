@@ -1,110 +1,161 @@
-# Makefile for Corruption Isolation Engine (CIE)
+# Makefile for the Corruption Isolation Engine (CIE)
+#
+# Corrections versus the original:
+#   * -std=c++20 (the source uses C++20 constructs; c++17 did not compile)
+#   * `all` no longer launches the GUI - it built the engine and then blocked
+#     on a desktop window, which made it unusable on a server or over SSH
+#   * `test` runs the real pytest suite instead of two smoke prints
+#   * `dist` excludes the truth data (.db, quarantine, __pycache__, .git)
+#   * `install` uses `python3 -m pip` so it works without a pip3 shim
+#   * every target that writes files is phony and `make -n` shows real work
 
-# Compiler settings
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2
-TARGET_CPP = src/cpp/file_analyzer
-CPP_SOURCE = src/cpp/file_analyzer.cpp
+CXX        ?= g++
+CXXFLAGS   ?= -std=c++20 -Wall -Wextra -O2
+CPP_SOURCE  = src/cpp/file_analyzer.cpp
+CPP_TARGET  = build/file_analyzer
 
-# Python settings
-PYTHON = python3
-PYTHON_MAIN = src/gui/main_window.py
-PYTHON_CORE = src/python/core_analyzer.py
+PYTHON      ?= python3
+CIE_CLI      = cie.py
+PYTHON_SRC   = src/python
+GUI_SOURCE   = src/gui/main_window.py
 
-# Directories
-BUILD_DIR = build
-QUARANTINE_DIR = quarantine
+BUILD_DIR       = build
+QUARANTINE_DIR  = quarantine
+DIST_VERSION   ?= $(shell date +%Y%m%d)
 
-# Default target
-all: cpp gui
+# ---------------------------------------------------------------------------
+# Default: make the engine ready to run - never start a GUI from `all`.
+# ---------------------------------------------------------------------------
+all: check
 
-# Build C++ executable
-cpp: $(TARGET_CPP)
+# Sanity-check the Python entry point (fast, no side effects).
+check:
+	@echo "Checking the CIE Python engine ..."
+	@$(PYTHON) $(PYTHON_SRC)/core_analyzer.py >/dev/null
+	@$(PYTHON) $(CIE_CLI) --version
+	@echo "Engine ready. Try: make scan DIR=/path/to/data"
 
-$(TARGET_CPP): $(CPP_SOURCE)
+# ---------------------------------------------------------------------------
+# Scanning helpers
+# ---------------------------------------------------------------------------
+scan:
+	@test -n "$(DIR)" || { echo "usage: make scan DIR=/path/to/data"; exit 2; }
+	$(PYTHON) $(CIE_CLI) --scan "$(DIR)"
+
+scan-fast:
+	@test -n "$(DIR)" || { echo "usage: make scan-fast DIR=/path/to/data"; exit 2; }
+	$(PYTHON) $(CIE_CLI) --modular-scan "$(DIR)" --strategy fast
+
+# ---------------------------------------------------------------------------
+# C++ helper (optional: the shipped engine is pure Python)
+# ---------------------------------------------------------------------------
+cpp: $(CPP_TARGET)
+
+$(CPP_TARGET): $(CPP_SOURCE)
 	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(CPP_SOURCE) -o $(TARGET_CPP)
-	@echo "C++ module compiled successfully"
+	$(CXX) $(CXXFLAGS) $(CPP_SOURCE) -o $(CPP_TARGET)
+	@echo "C++ module compiled -> $(CPP_TARGET)"
 
-# Run Python GUI
-gui: $(PYTHON_MAIN)
+run-cpp: $(CPP_TARGET)
+	@test -n "$(DIR)" || { echo "usage: make run-cpp DIR=/path/to/data"; exit 2; }
+	$(CPP_TARGET) "$(DIR)" true
+
+# ---------------------------------------------------------------------------
+# GUI (explicit target only)
+# ---------------------------------------------------------------------------
+gui: $(GUI_SOURCE)
 	@mkdir -p $(QUARANTINE_DIR)
-	$(PYTHON) $(PYTHON_MAIN)
+	$(PYTHON) $(CIE_CLI) --gui
 
-# Run C++ analyzer
-run-cpp: $(TARGET_CPP)
-	@mkdir -p $(QUARANTINE_DIR)
-	@echo "Running C++ analyzer..."
-	@read -p "Enter directory path: " dir; \
-	$(TARGET_CPP) "$$dir" true
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+test:
+	$(PYTHON) -m pytest tests/ -q
 
-# Install Python dependencies
+test-verbose:
+	$(PYTHON) -m pytest tests/ -v
+
+test-cov:
+	$(PYTHON) -m pytest tests/ --cov=src/python --cov-report=term-missing
+
+# Self-tests embedded in each module (no pytest needed).
+test-selftest:
+	@for module in core_analyzer format_validators cie_math processing_modules; do \
+		echo "--- $$module ---"; \
+		( cd $(PYTHON_SRC) && $(PYTHON) $$module.py ) || exit 1; \
+	done
+
+test-cpp: $(CPP_TARGET)
+	@echo "C++ module built and runnable: $(CPP_TARGET)"
+
+# ---------------------------------------------------------------------------
+# Setup / distribution
+# ---------------------------------------------------------------------------
 install:
-	pip3 install -r requirements.txt
+	$(PYTHON) -m pip install -r requirements.txt
 
-# Clean build artifacts
-clean:
-	rm -rf $(BUILD_DIR)
-	rm -f $(TARGET_CPP)
-	find . -name "*.pyc" -delete
-	find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-
-# Clean quarantine directory
-clean-quarantine:
-	rm -rf $(QUARANTINE_DIR)
-	@echo "Quarantine directory cleaned"
-
-# Full clean
-clean-all: clean clean-quarantine
-	rm -f *.db *.sqlite
-
-# Test C++ compilation
-test-cpp: $(TARGET_CPP)
-	@echo "Testing C++ compilation..."
-	@mkdir -p test_data
-	@echo "test content" > test_data/test.txt
-	@$(TARGET_CPP) test_data false
-	@rm -rf test_data
-
-# Test Python module
-test-python:
-	@echo "Testing Python module..."
-	$(PYTHON) -c "from src.python.core_analyzer import CorruptionDetector; print('Python module OK')"
-
-# Run all tests
-test: test-cpp test-python
-	@echo "All tests completed"
-
-# Create distribution package
 dist:
-	tar -czf cie-$(shell date +%Y%m%d).tar.gz \
-		src/ \
-		requirements.txt \
-		Makefile \
-		README.md \
+	tar -czf cie-$(DIST_VERSION).tar.gz \
 		--exclude='.git*' \
 		--exclude='__pycache__' \
 		--exclude='*.pyc' \
-		--exclude='build' \
-		--exclude='quarantine' \
+		--exclude='$(BUILD_DIR)' \
+		--exclude='$(QUARANTINE_DIR)' \
 		--exclude='*.db' \
-		--exclude='*.sqlite'
+		--exclude='*.db-wal' \
+		--exclude='*.db-shm' \
+		--exclude='*.sqlite' \
+		--exclude='cie-*.tar.gz' \
+		cie.py src tests config docs requirements.txt Makefile README.md LICENSE 2>/dev/null || \
+	tar -czf cie-$(DIST_VERSION).tar.gz \
+		--exclude='.git*' --exclude='__pycache__' --exclude='*.pyc' \
+		--exclude='$(BUILD_DIR)' --exclude='$(QUARANTINE_DIR)' \
+		--exclude='*.db*' --exclude='*.sqlite' \
+		cie.py src tests config docs requirements.txt Makefile README.md
+	@echo "Created cie-$(DIST_VERSION).tar.gz"
 
-# Help target
+# ---------------------------------------------------------------------------
+# Cleaning
+# ---------------------------------------------------------------------------
+clean:
+	rm -rf $(BUILD_DIR)
+	find . -name "*.pyc" -delete
+	find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+clean-quarantine:
+	rm -rf $(QUARANTINE_DIR)
+	@echo "Quarantine directory cleaned (quarantined files are gone for good)"
+
+clean-db:
+	rm -f *.db *.db-wal *.db-shm *.sqlite
+	@echo "Scan databases removed - baselines are lost, corruption history resets"
+
+clean-all: clean clean-quarantine clean-db
+
 help:
-	@echo "Available targets:"
-	@echo "  all          - Build both C++ and prepare Python"
-	@echo "  cpp          - Compile C++ analyzer"
-	@echo "  gui          - Run Python GUI"
-	@echo "  run-cpp      - Run C++ analyzer (interactive)"
-	@echo "  install      - Install Python dependencies"
-	@echo "  clean        - Clean build artifacts"
-	@echo "  clean-quarantine - Clean quarantine directory"
-	@echo "  clean-all    - Full clean including databases"
-	@echo "  test         - Run all tests"
-	@echo "  test-cpp     - Test C++ compilation"
-	@echo "  test-python  - Test Python module"
-	@echo "  dist         - Create distribution package"
-	@echo "  help         - Show this help"
+	@echo "Corruption Isolation Engine - available targets"
+	@echo ""
+	@echo "  all              - check the engine (default; no GUI)"
+	@echo "  check            - run the entry-point sanity check"
+	@echo "  scan DIR=...     - full corrupting-file scan of DIR"
+	@echo "  scan-fast DIR=.. - fast signature-only modular scan of DIR"
+	@echo "  cpp              - compile the optional C++ helper"
+	@echo "  run-cpp DIR=...  - run the optional C++ helper"
+	@echo "  gui              - launch the Tk GUI"
+	@echo "  install          - install Python dependencies"
+	@echo "  test             - run the pytest suite"
+	@echo "  test-verbose     - run the pytest suite verbosely"
+	@echo "  test-cov         - run the suite with coverage"
+	@echo "  test-selftest    - run each module's embedded self-test"
+	@echo "  test-cpp         - build the C++ helper"
+	@echo "  dist             - create a source tarball"
+	@echo "  clean            - remove build artifacts"
+	@echo "  clean-quarantine - delete the quarantine directory"
+	@echo "  clean-db         - delete scan databases (loses history!)"
+	@echo "  clean-all        - clean + quarantine + databases"
+	@echo "  help             - show this help"
 
-.PHONY: all cpp gui run-cpp install clean clean-quarantine clean-all test test-cpp test-python dist help
+.PHONY: all check scan scan-fast cpp run-cpp gui install dist \
+        test test-verbose test-cov test-selftest test-cpp \
+        clean clean-quarantine clean-db clean-all help

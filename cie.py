@@ -17,6 +17,7 @@ import argparse
 import importlib
 import json
 import logging
+import os
 import sys
 import unittest
 from collections import Counter
@@ -74,6 +75,16 @@ class ScanSummary:
     largest_file_bytes: int
     corruption_rate_percent: float
     top_file_types: tuple[tuple[str, int], ...]
+    #: files that could not be analysed (permissions, I/O, database) - the
+    #: scan is incomplete when this is non-zero
+    failed_files: int = 0
+    #: non-corrupt advisories (empty files, high entropy, ...)
+    warning_files: int = 0
+    #: files whose content looks encrypted / renamed by a ransomware family.
+    #: These are counted inside corrupted_files (they are findings) but listed
+    #: separately here so "7 corrupted" can be read back as 6 structural
+    #: corruptions + 1 ransomware suspicion.
+    suspected_ransomware_files: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +215,9 @@ def result_to_dict(result: FileAnalysisResultLike) -> dict[str, Any]:
             "corruption_details": corruption_details,
         }
 
+    first_corrupt = getattr(result, "first_corrupt_at", None)
+    baseline_size = getattr(result, "baseline_size_bytes", None)
+
     return {
         "file_path": result_path(result),
         "file_size": int(getattr(result, "file_size", 0) or 0),
@@ -214,16 +228,46 @@ def result_to_dict(result: FileAnalysisResultLike) -> dict[str, Any]:
         "error_message": getattr(result, "error_message", None),
         "format_status": format_status(result),
         "shannon_entropy": float(getattr(result, "shannon_entropy", 0.0) or 0.0),
+        "warnings": [str(item) for item in (getattr(result, "warnings", ()) or ())],
+        "first_corrupted_at": first_corrupt.isoformat() if first_corrupt is not None else None,
+        "baseline_size_bytes": int(baseline_size) if baseline_size is not None else None,
         "format_validation": validation_payload,
     }
+
+
+_FAULT_STATUS_NAMES = frozenset({"UNREADABLE", "ERROR", "MISSING"})
+_WARNING_STATUS_NAMES = frozenset({"SUSPICIOUS_EMPTY", "SUSPICIOUS_HIGH_ENTROPY"})
+
+
+def is_fault(result: FileAnalysisResultLike) -> bool:
+    """True when the file could not be analysed (scan is incomplete)."""
+    fault = getattr(result, "has_fault", None)
+    if fault is not None:
+        return bool(fault)
+    return status_name(result) in _FAULT_STATUS_NAMES
+
+
+def is_warning(result: FileAnalysisResultLike) -> bool:
+    """True for non-corrupt advisories worth printing."""
+    warning = getattr(result, "is_warning", None)
+    if warning is not None:
+        return bool(warning)
+    return status_name(result) in _WARNING_STATUS_NAMES or bool(getattr(result, "warnings", ()))
 
 
 def build_summary(results: Sequence[FileAnalysisResultLike]) -> ScanSummary:
     total_files = len(results)
     corrupted_files = sum(1 for result in results if bool(getattr(result, "is_corrupted", False)))
+    suspected_ransomware_files = sum(
+        1 for result in results if status_name(result) == "SUSPECTED_RANSOMWARE"
+    )
     healthy_files = total_files - corrupted_files
     total_bytes = sum(int(getattr(result, "file_size", 0) or 0) for result in results)
-    unreadable_files = sum(1 for result in results if status_name(result) == "UNREADABLE")
+    unreadable_files = sum(1 for result in results if is_fault(result))
+    warning_files = sum(
+        1 for result in results
+        if is_warning(result) and not bool(getattr(result, "is_corrupted", False))
+    )
     largest_file_bytes = max((int(getattr(result, "file_size", 0) or 0) for result in results), default=0)
     corruption_rate_percent = (corrupted_files / total_files * 100.0) if total_files else 0.0
 
@@ -238,7 +282,47 @@ def build_summary(results: Sequence[FileAnalysisResultLike]) -> ScanSummary:
         largest_file_bytes=largest_file_bytes,
         corruption_rate_percent=corruption_rate_percent,
         top_file_types=tuple(sorted(type_counts.items(), key=lambda item: (-item[1], item[0]))),
+        failed_files=unreadable_files,
+        warning_files=warning_files,
+        suspected_ransomware_files=suspected_ransomware_files,
     )
+
+
+def build_secondary_sections(results: Sequence[FileAnalysisResultLike]) -> str:
+    """Render the 'not analysed' and 'warnings' sections.
+
+    Kept separate from the corruption list so a heuristic warning (empty file,
+    high entropy) is never confused with damage, and so a scan that could not
+    read half the files cannot look clean.
+    """
+    ordered = sorted(results, key=lambda item: result_path(item).casefold())
+    fault_results = [r for r in ordered if is_fault(r)]
+    warning_results = [
+        r for r in ordered
+        if is_warning(r) and not is_fault(r) and not bool(getattr(r, "is_corrupted", False))
+    ]
+
+    lines: list[str] = []
+    if fault_results:
+        lines.append("Not Analysed (scan incomplete for these files)")
+        lines.append("--------------------------------------------")
+        for result in fault_results:
+            lines.append(f"[{status_name(result)}] {result_path(result)}")
+            message = getattr(result, "error_message", None)
+            if message:
+                lines.append(f"    {message}")
+        lines.append("")
+
+    if warning_results:
+        lines.append("Warnings (not corruption)")
+        lines.append("-------------------------")
+        for result in warning_results:
+            lines.append(f"[{status_name(result)}] {result_path(result)}")
+            for item in (getattr(result, "warnings", ()) or ()):
+                lines.append(f"    - {item}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def build_text_report(
@@ -256,11 +340,20 @@ def build_text_report(
         f"Total files        : {summary.total_files}",
         f"Corrupted files    : {summary.corrupted_files}",
         f"Healthy files      : {summary.healthy_files}",
-        f"Unreadable files   : {summary.unreadable_files}",
+        f"Not analysed       : {summary.failed_files}",
+        f"Warnings           : {summary.warning_files}",
         f"Total bytes        : {summary.total_bytes:,} ({format_bytes(summary.total_bytes)})",
         f"Largest file       : {summary.largest_file_bytes:,} ({format_bytes(summary.largest_file_bytes)})",
         f"Corruption rate    : {summary.corruption_rate_percent:.2f}%",
     ]
+
+    if summary.suspected_ransomware_files:
+        count = summary.suspected_ransomware_files
+        verb = "looks" if count == 1 else "look"
+        lines.append(
+            f"  (of the corrupted files, {count} {verb} like ransomware rather "
+            "than format damage)"
+        )
 
     if quarantine_summary is not None and quarantine_summary.attempted > 0:
         lines.extend(
@@ -290,7 +383,9 @@ def build_text_report(
 
     if not visible_results:
         lines.append("No corrupted files detected.")
-        return "\n".join(lines) + "\n"
+        lines.append("")
+        lines.append(build_secondary_sections(results))
+        return "\n".join(lines).rstrip() + "\n"
 
     for result in visible_results:
         lines.append(f"[{status_name(result)}] {result_path(result)}")
@@ -304,6 +399,14 @@ def build_text_report(
         if error_message:
             lines.append(f"  Error          : {error_message}")
 
+        first_corrupt = getattr(result, "first_corrupt_at", None)
+        if first_corrupt is not None:
+            lines.append(f"  Corrupt since  : {first_corrupt.isoformat()}")
+
+        baseline_size = getattr(result, "baseline_size_bytes", None)
+        if baseline_size is not None:
+            lines.append(f"  Baseline size  : {int(baseline_size):,} bytes")
+
         validation = getattr(result, "format_validation", None)
         if validation is not None:
             details = getattr(validation, "corruption_details", None) or ()
@@ -314,6 +417,7 @@ def build_text_report(
 
         lines.append("")
 
+    lines.append(build_secondary_sections(results).rstrip())
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -330,6 +434,7 @@ def build_json_report(
         "summary": {
             "total_files": summary.total_files,
             "corrupted_files": summary.corrupted_files,
+            "suspected_ransomware_files": summary.suspected_ransomware_files,
             "healthy_files": summary.healthy_files,
             "unreadable_files": summary.unreadable_files,
             "total_bytes": summary.total_bytes,
@@ -356,14 +461,37 @@ def build_json_report(
 # ==============================================================================
 
 def build_detector(runtime: RuntimeBundle, args: argparse.Namespace) -> Any:
-    config = runtime.AnalyzerConfig(
-        db_path=args.db_path,
-        quarantine_dir=args.quarantine_dir,
-        chunk_size=args.chunk_size,
-        max_workers=args.max_workers,
-        entropy_threshold=args.entropy_threshold,
-        detect_ransomware=not args.disable_ransomware_detection,
-    )
+    """Create the detector, layering CLI flags over config/cie_config.json."""
+    core_module = runtime.core_module
+    load_config_file = getattr(core_module, "load_config_file", None)
+    config_from_mapping = getattr(core_module, "config_from_mapping", None)
+
+    file_config: dict[str, Any] = {}
+    if load_config_file is not None and not getattr(args, "no_config", False):
+        try:
+            file_config = load_config_file(getattr(args, "config", None))
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("could not read config file: %s", exc)
+
+    overrides = {
+        "db_path": args.db_path,
+        "quarantine_dir": args.quarantine_dir,
+        "chunk_size": args.chunk_size,
+        "max_workers": args.max_workers,
+        "entropy_threshold": args.entropy_threshold,
+        "detect_ransomware": (
+            False if args.disable_ransomware_detection else None
+        ),
+        "advanced_validators": False if getattr(args, "no_deep_validation", False) else None,
+    }
+
+    if config_from_mapping is not None:
+        config = config_from_mapping(file_config, **overrides)
+    else:
+        config = runtime.AnalyzerConfig(
+            **{key: value for key, value in overrides.items() if value is not None}
+        )
+
     return runtime.CorruptionDetector(config)
 
 
@@ -458,6 +586,17 @@ def run_cli_scan(runtime: RuntimeBundle, args: argparse.Namespace) -> int:
     if args.fail_on_findings and summary.corrupted_files > 0:
         return 2
 
+    # A scan that could not analyse every file is not a clean scan. Previously
+    # these failures were reported as "unreadable" and the tool still exited 0,
+    # so a broken run looked identical to a healthy directory.
+    if summary.failed_files > 0:
+        print(
+            f"Warning: {summary.failed_files} file(s) could not be analysed; "
+            f"the scan is incomplete.",
+            file=sys.stderr,
+        )
+        return 3
+
     return 0
 
 
@@ -512,27 +651,51 @@ def build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument("--gui", action="store_true", help="launch the graphical interface")
     mode_group.add_argument("--scan", metavar="DIRECTORY", help="scan a directory from the command line")
     mode_group.add_argument("--modular-scan", metavar="DIRECTORY", help="use modular processing system")
-    mode_group.add_argument("--fast-scan", metavar="DIRECTORY", help="FAST scan mode (optimized for speed)")
+    mode_group.add_argument("--fast-scan", metavar="DIRECTORY", help="modular FAST strategy scan")
     mode_group.add_argument("--library-status", action="store_true", help="show validator library availability")
+    mode_group.add_argument("--list-quarantine", action="store_true", help="list quarantined files")
+    mode_group.add_argument("--restore", metavar="FILE", action="append", help="restore a quarantined file (repeatable)")
     mode_group.add_argument("--self-test", action="store_true", help="run built-in launcher tests")
 
+    parser.add_argument(
+        "--strategy",
+        choices=("fast", "balanced", "deep"),
+        default="fast",
+        help="strategy used by --modular-scan (default: fast)",
+    )
     parser.add_argument("--no-recursive", action="store_true", help="scan only the top-level directory")
     parser.add_argument("--quarantine", action="store_true", help="quarantine corrupted files after scanning")
     parser.add_argument("--summary-only", action="store_true", help="print only the summary section")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
     parser.add_argument("--output", metavar="FILE", help="write report output to a file")
-    parser.add_argument("--fail-on-findings", action="store_true", help="return exit code 2 if corruption is found")
+    parser.add_argument(
+        "--fail-on-findings",
+        action="store_true",
+        help="return exit code 2 if corruption is found, 3 if files could not be analysed",
+    )
 
-    parser.add_argument("--db-path", default="cie_database.db", help="SQLite database path")
-    parser.add_argument("--quarantine-dir", default="quarantine", help="quarantine directory path")
-    parser.add_argument("--chunk-size", type=int, default=256 * 1024, help="streaming read chunk size in bytes")
-    parser.add_argument("--max-workers", type=int, default=max(1, min(32, 4 + 1)), help="maximum worker threads")
-    parser.add_argument("--entropy-threshold", type=float, default=7.95, help="high-entropy ransomware threshold")
+    parser.add_argument("--db-path", default=None, help="SQLite database path")
+    parser.add_argument("--quarantine-dir", default=None, help="quarantine directory path")
+    parser.add_argument("--chunk-size", type=int, default=None, help="streaming read chunk size in bytes")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="maximum worker threads (default: from config, else CPU count x2)",
+    )
+    parser.add_argument("--entropy-threshold", type=float, default=None, help="high-entropy warning threshold")
     parser.add_argument(
         "--disable-ransomware-detection",
         action="store_true",
-        help="disable entropy-based ransomware heuristics",
+        help="disable ransomware heuristics",
     )
+    parser.add_argument(
+        "--no-deep-validation",
+        action="store_true",
+        help="use header/signature checks only (skip Pillow/PyPDF2/openpyxl/ffprobe)",
+    )
+    parser.add_argument("--config", metavar="FILE", help="path to cie_config.json (default: config/cie_config.json)")
+    parser.add_argument("--no-config", action="store_true", help="ignore the configuration file")
 
     verbosity_group = parser.add_mutually_exclusive_group()
     verbosity_group.add_argument("--verbose", "-v", action="store_true", help="enable verbose logging and reporting")
@@ -544,11 +707,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
-    if args.max_workers < 1:
+    # None means "not supplied on the command line" so the config file can win.
+    if args.max_workers is not None and args.max_workers < 1:
         raise ValueError("--max-workers must be at least 1")
-    if args.chunk_size < 1:
+    if args.chunk_size is not None and args.chunk_size < 1:
         raise ValueError("--chunk-size must be at least 1")
-    if args.entropy_threshold < 0.0 or args.entropy_threshold > 8.0:
+    if args.entropy_threshold is not None and not 0.0 <= args.entropy_threshold <= 8.0:
         raise ValueError("--entropy-threshold must be between 0.0 and 8.0")
     return args
 
@@ -674,6 +838,80 @@ def run_self_tests() -> int:
 # 8. MAIN
 # ==============================================================================
 
+def run_modular_scan(args: argparse.Namespace, *, default_strategy: str | None = None) -> int:
+    """Run the modular scanner in-process.
+
+    v2.0 tried to exec `<repo>/modular_scanner.py`, which does not exist (the
+    file is in src/python), without an interpreter or exec bit, and used the
+    un-imported `os` module. Importing it directly removes that whole class of
+    failure.
+    """
+    project_root = Path(__file__).resolve().parent
+    modular_dir = project_root / "src" / "python"
+    if str(modular_dir) not in sys.path:
+        sys.path.append(str(modular_dir))
+
+    try:
+        import modular_scanner
+    except Exception as exc:
+        print(f"Error: modular scanner unavailable: {exc}", file=sys.stderr)
+        return 1
+
+    directory = args.modular_scan or args.fast_scan
+    if not directory:
+        print("Error: no directory supplied for the modular scan", file=sys.stderr)
+        return 1
+
+    strategy = default_strategy or getattr(args, "strategy", "fast")
+    argv = [str(directory), "--strategy", strategy]
+    if args.no_recursive:
+        argv.append("--no-recursive")
+    if args.json:
+        argv.append("--json")
+    if args.output:
+        argv += ["--output", args.output]
+
+    return modular_scanner.main(argv)
+
+
+def run_restore(runtime: RuntimeBundle, args: argparse.Namespace) -> int:
+    detector = build_detector(runtime, args)
+    failures = 0
+    for target in args.restore:
+        try:
+            restored = detector.restore_file(target)
+        except Exception as exc:
+            print(f"Error: could not restore {target}: {exc}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"Restored {target} -> {restored}")
+    return 1 if failures else 0
+
+
+def print_quarantine_listing(detector: Any) -> int:
+    try:
+        entries = detector.list_quarantine(include_restored=False)
+    except Exception as exc:
+        print(f"Error: could not read the quarantine log: {exc}", file=sys.stderr)
+        return 1
+
+    print("Quarantined Files")
+    print("=================")
+    if not entries:
+        print("(none)")
+        return 0
+
+    for entry in entries:
+        when = entry.quarantined_at.isoformat() if entry.quarantined_at else "unknown"
+        print(f"{entry.quarantine_path}")
+        print(f"    original : {entry.original_path}")
+        print(f"    reason   : {entry.reason}")
+        print(f"    when     : {when}")
+    print()
+    print("Restore with: cie.py --restore <path>")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -688,26 +926,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         return run_self_tests()
 
-    require_gui = bool(args.gui or (not args.scan and not args.library_status))
+    # The GUI is only imported when the GUI is actually requested; previously
+    # --library-status/--modular-scan/--fast-scan all pulled in tkinter.
+    gui_mode = bool(args.gui or (not any([
+        args.scan,
+        args.modular_scan,
+        args.fast_scan,
+        args.library_status,
+        args.list_quarantine,
+        args.restore,
+    ])))
+
     try:
-        runtime = load_runtime(require_gui=require_gui)
+        runtime = load_runtime(require_gui=gui_mode)
     except Exception as exc:
         print(f"Error importing runtime modules: {exc}", file=sys.stderr)
         print("Run this from the project root directory or verify the src layout.", file=sys.stderr)
         return 1
 
+    if args.list_quarantine:
+        return print_quarantine_listing(build_detector(runtime, args))
+
+    if args.restore:
+        return run_restore(runtime, args)
+
     if args.library_status:
-        detector = build_detector(runtime, args)
-        return print_library_status(detector)
+        return print_library_status(build_detector(runtime, args))
+
+    if args.fast_scan:
+        return run_modular_scan(args, default_strategy="fast")
 
     if args.modular_scan:
-        # Use modular scanner
-        import subprocess
-        modular_script = os.path.join(os.path.dirname(__file__), 'modular_scanner.py')
-        cmd = [modular_script, args.modular_scan]
-        if args.no_recursive:
-            cmd.append('--no-recursive')
-        return subprocess.call(cmd)
+        return run_modular_scan(args)
 
     if args.scan:
         return run_cli_scan(runtime, args)

@@ -19,7 +19,7 @@ This guide is for developers who want to contribute to, extend, or integrate wit
 ### Prerequisites
 
 - Python 3.7+
-- g++ (C++17 support)
+- g++ (C++20 support)
 - Git
 - Make
 - FFmpeg (for media file testing)
@@ -77,7 +77,7 @@ flake8 src/ tests/ --max-line-length=100
 mypy src/python/
 
 # Testing with coverage
-pytest tests/ --cov=src/python --cov-report=html
+pytest tests/ --cov=src/python --cov-report=term-missing
 ```
 
 ## Architecture Overview
@@ -125,7 +125,7 @@ CIE follows a modular architecture with clear separation of concerns:
 - Streaming analysis
 - Memory management
 
-#### 4. Mathematical Utilities (`src/python/math.py`)
+#### 4. Mathematical Utilities (`src/python/cie_math.py`)
 - Entropy calculations
 - Binary pattern analysis
 - Statistical operations
@@ -146,7 +146,7 @@ src/
 │   ├── core_analyzer.py          # Main engine
 │   ├── format_validators.py      # File validators
 │   ├── processing_modules.py     # Processing pipeline
-│   ├── math.py                   # Math utilities
+│   ├── cie_math.py                # Math utilities
 │   └── modular_scanner.py        # Advanced scanning
 ├── cpp/
 │   ├── file_analyzer.cpp         # C++ analyzer
@@ -163,7 +163,7 @@ cie.py (entry point)
 ├── core_analyzer.py
 │   ├── format_validators.py
 │   ├── processing_modules.py
-│   └── math.py
+│   └── cie_math.py
 ├── modular_scanner.py
 │   ├── core_analyzer.py
 │   └── processing_modules.py
@@ -412,27 +412,23 @@ def save_custom_analysis(conn: sqlite3.Connection, result: CustomAnalysisResult)
 
 ```
 tests/
-├── unit/
-│   ├── test_core_analyzer.py
-│   ├── test_format_validators.py
-│   ├── test_processing_modules.py
-│   └── test_math.py
-├── integration/
-│   ├── test_full_scan.py
-│   ├── test_quarantine.py
-│   └── test_database.py
-├── fixtures/
-│   ├── sample_files/
-│   └── test_data/
-└── conftest.py
+├── conftest.py                  # shared fixtures (corpus, detector, real-file builders)
+├── test_core_analyzer.py        # detector, statuses, baselines, migration
+├── test_format_validators.py    # per-format validators
+├── test_processing_modules.py   # encodings, processors, strategies
+├── test_cie_math.py             # entropy / variance / checksums
+├── test_import_hygiene.py       # no stdlib shadowing, modules import standalone
+└── test_cli.py                  # end-to-end CLI: scan, JSON, exit codes, quarantine
 ```
+
+Run them with `make test`, or `python3 -m pytest tests/ -q`.
 
 ### Writing Tests
 
 #### Unit Tests
 
 ```python
-# tests/unit/test_format_validators.py
+# tests/test_format_validators.py
 
 import unittest
 from unittest.mock import patch, mock_open
@@ -457,7 +453,7 @@ class TestPDFValidator(unittest.TestCase):
 #### Integration Tests
 
 ```python
-# tests/integration/test_full_scan.py
+# tests/test_cli.py
 
 import unittest
 import tempfile
@@ -498,13 +494,13 @@ pytest
 pytest --cov=src/python --cov-report=html
 
 # Run specific test file
-pytest tests/unit/test_core_analyzer.py
+pytest tests/test_core_analyzer.py
 
 # Run with verbose output
 pytest -v
 
 # Run specific test method
-pytest tests/unit/test_core_analyzer.py::TestCorruptionDetector::test_scan_directory
+pytest tests/test_core_analyzer.py::test_scan_directory_detects_corruption
 ```
 
 ### Test Data Management

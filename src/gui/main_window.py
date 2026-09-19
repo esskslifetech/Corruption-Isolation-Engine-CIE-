@@ -1085,23 +1085,106 @@ class CIEMainWindow:
         return Path("quarantine")
 
     def view_quarantine(self) -> None:
+        """List quarantined files from the quarantine log, with Restore.
+
+        The original viewer listed whatever happened to sit in the quarantine
+        directory and offered no way to act on it, so a quarantined file could
+        only be recovered by hand-editing the database.
+        """
         quarantine_dir = self._quarantine_directory()
-        if not quarantine_dir.exists() or not any(quarantine_dir.iterdir()):
-            messagebox.showinfo("Quarantine", "Quarantine directory is empty.")
+        try:
+            entries = list(self.detector.list_quarantine())
+        except Exception as exc:
+            messagebox.showerror("Quarantine", f"Could not read the quarantine log:\n{exc}")
+            return
+
+        stray_files = []
+        if quarantine_dir.exists():
+            known = {Path(entry.quarantine_path).name for entry in entries}
+            stray_files = sorted(
+                (path for path in quarantine_dir.iterdir() if path.name not in known),
+                key=lambda path: path.name.casefold(),
+            )
+
+        if not entries and not stray_files:
+            messagebox.showinfo("Quarantine", "Quarantine is empty.")
             return
 
         viewer = tk.Toplevel(self.root)
         viewer.title("Quarantine Viewer")
-        viewer.geometry("760x460")
+        viewer.geometry("860x500")
+        viewer.transient(self.root)
 
         frame = ttk.Frame(viewer, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        listbox = tk.Listbox(frame)
-        listbox.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frame,
+            text="Select one or more files to restore. Files are put back at their "
+                 "original location (without overwriting anything).",
+        ).pack(anchor=tk.W, pady=(0, 6))
 
-        for entry in sorted(quarantine_dir.iterdir(), key=lambda path: path.name.casefold()):
-            listbox.insert(tk.END, entry.name)
+        listbox = tk.Listbox(frame, selectmode=tk.EXTENDED)
+        listbox.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=listbox.yview)
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        # index -> callable that performs the restore for that row
+        actions: dict[int, Path] = {}
+        for entry in entries:
+            when = entry.quarantined_at.strftime("%Y-%m-%d %H:%M") if entry.quarantined_at else "?"
+            listbox.insert(
+                tk.END,
+                f"{Path(entry.quarantine_path).name}  <-  {entry.original_path}  "
+                f"[{when}]  {entry.reason}",
+            )
+            actions[listbox.size() - 1] = Path(entry.quarantine_path)
+        for path in stray_files:
+            listbox.insert(tk.END, f"{path.name}  (not in the quarantine log - cannot be restored)")
+            actions[listbox.size() - 1] = None  # type: ignore[assignment]
+
+        button_row = ttk.Frame(viewer, padding=(10, 0, 10, 10))
+        button_row.pack(fill=tk.X)
+
+        def restore_selected() -> None:
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("No Selection", "Please select a file to restore.")
+                return
+            restored, skipped, failures = [], [], []
+            for index in selection:
+                quarantine_path = actions.get(index)
+                if quarantine_path is None:
+                    skipped.append(listbox.get(index).split("  ")[0])
+                    continue
+                try:
+                    restored.append(self.detector.restore_file(quarantine_path))
+                except Exception as exc:
+                    failures.append(f"{quarantine_path.name}: {exc}")
+
+            lines = []
+            if restored:
+                lines.append("Restored:\n" + "\n".join(f"  {path}" for path in restored))
+            if skipped:
+                lines.append("Not in the quarantine log (left in place):\n"
+                             + "\n".join(f"  {name}" for name in skipped))
+            if failures:
+                lines.append("Failed:\n" + "\n".join(f"  {failure}" for failure in failures))
+
+            (messagebox.showwarning if failures else messagebox.showinfo)(
+                "Restore", "\n\n".join(lines) or "Nothing to restore."
+            )
+            viewer.destroy()
+            if restored:
+                self.refresh_views()
+
+        ttk.Button(button_row, text="Restore Selected", command=restore_selected).pack(side=tk.RIGHT)
+        ttk.Button(button_row, text="Close", command=viewer.destroy).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+
 
     def show_library_status(self) -> None:
         try:

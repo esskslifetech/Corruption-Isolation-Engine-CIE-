@@ -428,7 +428,7 @@ Pillow                    Not Available
 ```
 **Solution**: Install missing dependencies:
 ```bash
-pip3 install Pillow PyPDF2 python-docx openpyxl
+pip3 install Pillow pypdf python-docx openpyxl
 ```
 
 #### Database Locked

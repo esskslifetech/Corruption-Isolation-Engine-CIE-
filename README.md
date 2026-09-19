@@ -399,7 +399,8 @@ corpus; the C++ helper reached 107.3 MB/s but is not wired into the engine):
 ## Verification status
 
 All numbers below were measured by the audit harness (`/home/user/audit/`) on
-Linux, Python 3.11, Pillow installed, ffmpeg absent:
+Linux with Python 3.13.14, Pillow 12.3, pypdf 6.19, python-docx 1.1.2,
+openpyxl 3.1.5, numpy 2.3.5 and pytest 9.0.3 installed, **ffmpeg absent**:
 
 | Check | Result |
 |-------|--------|

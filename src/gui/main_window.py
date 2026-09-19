@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -307,6 +307,87 @@ def filter_results(
         return normalized_query in haystack
 
     return [result for result in results if matches(result)]
+
+
+def _normalize_result_path(path: str) -> str:
+    """Put displayed and engine-reported paths on the same footing."""
+    try:
+        return str(Path(path).expanduser().resolve())
+    except OSError:  # pragma: no cover - exotic paths
+        return str(Path(path).expanduser())
+
+
+def format_rebaseline_summary(
+    outcomes: Sequence[Any], *, forced: bool = False, dry_run: bool = False
+) -> str:
+    """Human-readable account of a re-baseline action (pure; no Tk involved)."""
+    accepted = [o for o in outcomes if getattr(o, "action", "") == "rebaselined"]
+    refused = [o for o in outcomes if getattr(o, "action", "") == "refused"]
+    missing = [o for o in outcomes if getattr(o, "action", "") == "missing"]
+
+    lines: list[str] = []
+    if accepted:
+        lines.append(f"Accepted as the new baseline ({len(accepted)}):")
+        for outcome in accepted[:10]:
+            previous = getattr(outcome, "previous_status", None)
+            suffix = f"  (was {previous})" if previous else ""
+            lines.append(f"  {outcome.path}{suffix}")
+        if len(accepted) > 10:
+            lines.append(f"  ... and {len(accepted) - 10} more")
+
+    if refused:
+        lines.append("")
+        lines.append(f"Refused - still failing format validation ({len(refused)}):")
+        for outcome in refused[:10]:
+            lines.append(f"  {outcome.path}")
+            reason = getattr(outcome, "reason", None)
+            if reason:
+                lines.append(f"      {reason}")
+
+    if missing:
+        lines.append("")
+        lines.append(f"Not found ({len(missing)}):")
+        for outcome in missing[:10]:
+            lines.append(f"  {outcome.path}")
+
+    if not lines:
+        return "Nothing to do: the selection did not match any files on disk."
+
+    if forced:
+        lines.append("")
+        lines.append(
+            "Forced acceptance was used: those files still fail format validation, "
+            "so the next scan will flag them again."
+        )
+    if dry_run:
+        lines.append("")
+        lines.append("Dry run: nothing was written to the database.")
+    return "\n".join(lines)
+
+
+def merge_rebaselined_results(
+    results: Sequence[FileAnalysisResultLike],
+    refreshed: Mapping[str, FileAnalysisResultLike],
+    removed: Iterable[str] = (),
+) -> list[FileAnalysisResultLike]:
+    """Return the displayed results after a re-baseline (pure; no Tk involved).
+
+    Accepted files are replaced by their *re-analysed* result, so the table keeps
+    showing what the engine reports now rather than what it reported before.
+    Files that disappeared from disk are dropped; everything else is untouched.
+    """
+    refreshed_by_path = {
+        _normalize_result_path(path): value for path, value in refreshed.items()
+    }
+    removed_paths = {_normalize_result_path(path) for path in removed}
+
+    updated: list[FileAnalysisResultLike] = []
+    for result in results:
+        key = _normalize_result_path(result_path(result))
+        if key in removed_paths:
+            continue
+        updated.append(refreshed_by_path.get(key, result))
+    return updated
 
 
 def result_to_export_dict(result: FileAnalysisResultLike) -> dict[str, Any]:
@@ -606,6 +687,9 @@ class CIEMainWindow:
     def _setup_context_menu(self) -> None:
         self.context_menu = tk.Menu(self.root, tearoff=False)
         self.context_menu.add_command(label="Quarantine", command=self.quarantine_selected)
+        self.context_menu.add_command(
+            label="Rebaseline (accept current content)", command=self.rebaseline_selected
+        )
         self.context_menu.add_command(label="Delete", command=self.delete_selected)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="View Format Details", command=self.show_format_details)
@@ -1071,6 +1155,92 @@ class CIEMainWindow:
             confirm=True,
             success_message=True,
         )
+
+    def rebaseline_selected(self) -> None:
+        """Accept the selected files' current content as their new baseline.
+
+        The CLI has offered `--rebaseline` since the Phase-4 work; this is the
+        same action from the results table. A file the validators still reject
+        is refused first and can only be forced after a second, explicit
+        confirmation - re-baselining must never quietly bless a broken file.
+        """
+        selected_files = self.get_selected_files()
+        if not selected_files:
+            messagebox.showwarning("No Selection", "Please select files to re-baseline.")
+            return
+
+        preview = "\n".join(f"  {path}" for path in selected_files[:5])
+        if len(selected_files) > 5:
+            preview += f"\n  ... and {len(selected_files) - 5} more"
+        noun = "file" if len(selected_files) == 1 else "files"
+
+        approved = messagebox.askyesno(
+            "Rebaseline",
+            f"Accept today's content of the selected {noun} as the new baseline?\n\n"
+            f"{preview}\n\n"
+            "This clears the corruption flag and stops these files being reported on "
+            "later scans. Only do it after you have reviewed them.",
+            icon="warning",
+        )
+        if not approved:
+            return
+
+        try:
+            outcomes = list(self.detector.rebaseline(tuple(selected_files), recursive=False))
+        except Exception as exc:
+            messagebox.showerror("Rebaseline", f"Re-baseline failed:\n{exc}")
+            return
+
+        refused = [o for o in outcomes if getattr(o, "action", "") == "refused"]
+        forced = False
+        if refused:
+            names = "\n".join(f"  {o.path}" for o in refused[:5])
+            if messagebox.askyesno(
+                "Refused",
+                f"{len(refused)} selected file(s) still fail format validation:\n\n"
+                f"{names}\n\n"
+                "They look broken to the validators. Accept them anyway? The corruption "
+                "flag is cleared, but the next scan will flag them again.",
+                icon="warning",
+            ):
+                forced = True
+                try:
+                    forced_outcomes = self.detector.rebaseline(
+                        tuple(o.path for o in refused), recursive=False, force=True
+                    )
+                except Exception as exc:
+                    messagebox.showerror("Rebaseline", f"Forced re-baseline failed:\n{exc}")
+                    return
+                replaced = {o.path for o in forced_outcomes}
+                outcomes = [o for o in outcomes if o.path not in replaced] + list(forced_outcomes)
+
+        self._apply_rebaseline_to_view(outcomes)
+        messagebox.showinfo("Rebaseline", format_rebaseline_summary(outcomes, forced=forced))
+
+    def _apply_rebaseline_to_view(self, outcomes: Sequence[Any]) -> None:
+        """Show the post-action truth: accepted files are re-analysed."""
+        refreshed: dict[str, FileAnalysisResultLike] = {}
+        removed: set[str] = set()
+        accepted = 0
+
+        for outcome in outcomes:
+            action = getattr(outcome, "action", "")
+            if action == "rebaselined":
+                accepted += 1
+                try:
+                    refreshed[outcome.path] = self.detector.analyze_file(outcome.path)
+                except Exception:
+                    removed.add(outcome.path)
+            elif action == "missing":
+                removed.add(outcome.path)
+
+        if refreshed or removed:
+            self.current_results = merge_rebaselined_results(
+                self.current_results, refreshed, removed
+            )
+            self.refresh_views()
+
+        self._set_status(f"Rebaselined {accepted} file(s).")
 
     def quarantine_all_corrupted(self) -> None:
         corrupted_files = [result_path(result) for result in self.current_results if result_is_corrupted(result)]

@@ -207,6 +207,20 @@ lists in machine-readable form.
 Exit codes: `0` everything accepted, `1` nothing accepted (missing paths or
 refused files), `3` partially accepted.
 
+#### The same action from the GUI
+
+1. Scan the directory that holds the file.
+2. Right-click the finding in the *Corrupted* (or *All Files*) tab.
+3. Choose **Rebaseline (accept current content)**.
+4. Confirm. The dialog lists the files it is about to accept and warns that they
+   will stop being reported on later scans.
+5. If a file still fails format validation, it is **refused** and you are asked
+   again; only a second confirmation accepts it (the equivalent of
+   `--rebaseline-force`), and the summary says so afterwards.
+
+Accepted files are re-analysed immediately, so the table keeps showing what the
+engine reports now rather than what it reported before.
+
 ### Configuration Options
 
 #### Database Settings

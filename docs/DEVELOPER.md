@@ -160,7 +160,8 @@ src/
 │   └── cie_accel.cpp             # C ABI shim loaded by the engine
 └── gui/
     ├── __init__.py
-    └── main_window.py            # Tkinter GUI
+    └── main_window.py            # Tkinter GUI (quarantine viewer + restore,
+                                  right-click rebaseline, library status)
 ```
 
 ### Module Dependencies
@@ -431,7 +432,8 @@ tests/
 └── test_cli.py                  # end-to-end CLI: scan, JSON, exit codes, quarantine, rebaseline
 ```
 
-Run them with `make test`, or `python3 -m pytest tests/ -q` (213 tests).
+Run them with `make test`, or `python3 -m pytest tests/ -q` (226 tests; one
+display-only check skips when there is no X display).
 
 ### Continuous Integration
 

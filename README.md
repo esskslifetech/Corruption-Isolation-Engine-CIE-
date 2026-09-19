@@ -7,7 +7,7 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 > **Status note (audit revision).** The v2.0 tree shipped with a stdlib-shadowing
 > module name that broke every `cie.py` command, unit tests that called functions
 > which did not exist, and a requirements file that `pip` refused to install.
-> Those defects are fixed in this revision; `python3 -m pytest tests/` (213
+> Those defects are fixed in this revision; `python3 -m pytest tests/` (226
 > tests) and the CLI matrix in `docs/USER_GUIDE.md` pass, and the workflow in
 > `.github/workflows/ci.yml` re-checks all of it on a clean checkout. Measured detection
 > limits and the remaining known gaps are listed under
@@ -37,12 +37,15 @@ A powerful software tool for detecting, isolating, and separating corrupted file
 - **SQLite Database**: Persistent storage of file metadata and analysis history with WAL mode
 - **Cross-Platform Support**: Works on Linux, macOS, and Windows
 - **Concurrent Processing**: Multi-threaded scanning with configurable worker threads
-- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 213 pytest tests
+- **Self-Testing**: `python3 cie.py --self-test`, per-module self-tests, and 226 pytest tests
 - **Continuous Integration**: the workflow in `.github/workflows/ci.yml` installs
   the dependencies, builds the C++ engine, runs the tests and scans a directory
   of known-good fixtures with `--fail-on-findings` on every push
-- **Deliberate re-baselining**: `python3 cie.py --rebaseline <path>` accepts the
-  current content of a file you have reviewed as the new baseline
+- **Deliberate re-baselining**: `python3 cie.py --rebaseline <path>` - or
+  right-clicking the file in the results table and choosing *Rebaseline (accept
+  current content)* - accepts the content of a file you have reviewed as the new
+  baseline. Files the validators still reject need a second, explicit
+  confirmation
 - **Quarantine with restore**: quarantined files are logged and can be restored, never
   silently deleted, and the engine's own database is never scanned or quarantined
 
@@ -144,9 +147,11 @@ Features:
 - Enable auto-quarantine for corrupted files
 - View detailed results and statistics
 - Export reports to text files
-- Manage quarantined files
+- Manage quarantined files (viewer with Restore)
 - Configure scanning parameters
 - Real-time progress tracking
+- Right-click actions in the results table: Quarantine, Rebaseline (accept
+  current content), Delete, View Format Details, Open File Location, Copy Path
 
 ### Command Line Interface
 
@@ -349,7 +354,7 @@ make clean-quarantine
 # Full clean (including databases)
 make clean-all
 
-# Run tests (pytest, 213 tests)
+# Run tests (pytest, 226 tests)
 make test
 
 # Run the self-tests embedded in each module (no pytest needed)
@@ -494,7 +499,7 @@ openpyxl 3.1.5, python-pptx 1.0.2, numpy 2.3.5 and pytest 9.0.3 installed,
 
 | Check | Result |
 |-------|--------|
-| pytest suite | 213 passed |
+| pytest suite | 226 passed, 1 skipped (display-only menu check) |
 | CLI commands (`--version`, `--library-status`, `--self-test`, `--scan`, `--modular-scan`, `--fast-scan`, `--list-quarantine`, `--restore`) | all exit 0 |
 | Recall, formats with integrity metadata | 9/9 |
 | Recall, same-size damage found on a *second* scan (baseline) | 12/12 |
